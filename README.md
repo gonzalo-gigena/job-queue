@@ -9,7 +9,7 @@ The step-by-step build plan is in [PLAN.md](PLAN.md).
 ## Run it
 
 ```bash
-git clone --recurse-submodules https://github.com/<you>/job-queue.git
+git clone --recurse-submodules https://github.com/gonzalo-gigena/job-queue.git
 cd job-queue
 cp .env.example .env
 docker compose up --watch
