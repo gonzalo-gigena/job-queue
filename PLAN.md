@@ -132,3 +132,68 @@ random intervals and restart replicas. Assert: every job ends in `succeeded`,
 - Postgres is the ceiling (roughly thousands of jobs/sec on one node, depending on job size).
   The README should say that past this point you would shard queues across databases or
   switch to Kafka/NATS, and why you didn't need to.
+
+## Beyond the plan
+
+Build these after the phases above. Each starts from a problem real systems hit, and
+each should add a row to the README's Decisions & tradeoffs table. If one wouldn't,
+skip it. B1 is the one to build first.
+
+### B1 — Durable waits: sleep, wait for an event, time out
+**Why:** "Remind the user if they haven't verified their email in 3 days, and cancel
+the reminder if they do." Without this, that's a cron job scanning a table.
+1. Steps can call `Sleep(d)` and `WaitForEvent(key, timeout)`. A waiting step holds no
+   worker: its job ends and it writes `step_waits(run_id, step, event_key, expires_at)`.
+2. `POST /events {key, payload}` wakes every wait on that key. The scheduler's reaper
+   resumes waits whose `expires_at` has passed, with a timeout result.
+3. The event and the timeout can land at the same moment. Both paths resume with
+   `UPDATE workflow_steps SET status='running' … WHERE status='waiting'` and act only
+   if one row changed, so exactly one of them wins.
+4. Dashboard: waiting steps with their key and deadline.
+- **Done when:** 10,000 parked workflows use zero worker slots, and a race test that
+  fires the event right at the deadline never resumes a step twice.
+
+### B2 — Workflow versioning
+**Why:** you deploy a change to `signup` while 2,000 runs are in progress. A run that
+started on the old step graph can't safely continue on the new one.
+1. Workflows register with a version, e.g. `Workflow("signup", 2)`. `workflow_runs.version`
+   records the version a run started on, and the engine always advances a run with
+   that version's graph.
+2. Keep old versions registered until their last run finishes. The dashboard shows
+   runs per version, so you know when one is safe to delete.
+3. During a rolling deploy, a worker that gets a step for a version it doesn't have
+   puts the job back with a short delay instead of failing it.
+- **Done when:** deploying v2 mid-run lets every v1 run finish on v1 while new runs start on v2.
+
+### B3 — Fairness between tenants in one queue
+**Why:** one customer bulk-imports 1M jobs into `emails`, and every other customer's
+password-reset email waits an hour behind them. Phase 5's per-queue limits don't fix
+this: it's head-of-line blocking inside one queue.
+1. Jobs get an optional `fairness_key` (usually the tenant).
+2. Dequeue round-robins across keys that have queued work instead of taking the oldest
+   jobs overall, without scanning the big tenant's rows. For example: a small
+   `queue_keys(queue, fairness_key, last_served_at)` table, pick the least recently
+   served keys, then claim from each through the partial index (add `fairness_key` to it).
+3. Optional weights per key (a paid tier gets 3× the share).
+- **Done when:** with one key holding 1M jobs and 50 keys holding 100 each, the small
+  keys' p95 wait stays within 2× of a run without the flood. Chart both in the README.
+
+### B4 — Debounce and batching
+**Why:** 40 comment events in one minute should send one digest email, not 40.
+1. `debounce_key` + window: enqueueing with a key that already has a `queued` job pushes
+   that job's `run_at` forward instead of adding a new one. Only while it's still
+   `queued`: once a worker has claimed it, the next event starts a new job.
+2. `batch_key` + max size + max wait: events collect into one job whose handler gets all
+   the payloads.
+3. Both are upserts on a partial unique index `WHERE status='queued'`.
+- **Done when:** 1,000 events with one debounce key over 10 s produce exactly one job,
+  and an event that arrives while that job is running produces exactly one more.
+
+### B5 — Trace context through the queue
+**Why:** "this request was slow" often means "the job it enqueued was slow", and
+without propagation the trace stops at the enqueue.
+1. The SDK stores the W3C `traceparent` in job metadata at enqueue. The worker starts a
+   span linked to it, one per attempt, so retries show up in the same trace.
+2. Export with OpenTelemetry, off by default and turned on by `OTEL_EXPORTER_OTLP_ENDPOINT`.
+   The observability project can receive it.
+- **Done when:** one trace shows the HTTP request, the enqueue and every attempt of the job.
