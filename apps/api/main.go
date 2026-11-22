@@ -1,4 +1,8 @@
-// api: stateless HTTP service. `api healthcheck` lets the distroless image check itself.
+// One binary, several roles:
+//
+//	api              stateless HTTP service: enqueue and query jobs
+//	api worker       claims and runs jobs (WORKER_QUEUES, default "default")
+//	api healthcheck  lets the distroless image check itself
 package main
 
 import (
@@ -6,6 +10,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"os"
@@ -17,6 +22,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -34,7 +40,8 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(healthcheck())
 	}
-	if err := run(); err != nil {
+	worker := len(os.Args) > 1 && os.Args[1] == "worker"
+	if err := run(worker); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -47,6 +54,13 @@ func port() string {
 	return "8080"
 }
 
+func envOr(k, def string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return def
+}
+
 func healthcheck() int {
 	c := http.Client{Timeout: 2 * time.Second}
 	res, err := c.Get("http://localhost:" + port() + "/readyz")
@@ -56,7 +70,7 @@ func healthcheck() int {
 	return 0
 }
 
-func run() error {
+func run(worker bool) error {
 	replica, _ := os.Hostname()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("replica", replica))
 
@@ -71,6 +85,10 @@ func run() error {
 	defer pool.Close()
 
 	var draining atomic.Bool
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
+	defer stop()
+	errc := make(chan error, 2)
+	workDone := make(chan struct{})
 	mux := http.NewServeMux()
 	route := func(pattern string, h handler) { mux.Handle(pattern, instrument(pattern, replica, h)) }
 
@@ -84,6 +102,80 @@ func run() error {
 		}
 		return 200, map[string]bool{"ok": true}
 	})
+	if worker {
+		queues := splitQueues(envOr("WORKER_QUEUES", "default"))
+		if len(queues) == 0 {
+			return errors.New("WORKER_QUEUES lists no queue")
+		}
+		for _, q := range queues {
+			if !queueName.MatchString(q) {
+				return fmt.Errorf("WORKER_QUEUES: %q must match %s", q, queueName)
+			}
+		}
+		// LISTEN must bypass any pooler; today DATABASE_URL is already direct.
+		listenURL := envOr("DIRECT_DATABASE_URL", dbURL)
+		go func() {
+			defer close(workDone)
+			if err := work(ctx, pool, listenURL, replica, queues); err != nil && ctx.Err() == nil {
+				errc <- err
+			}
+		}()
+	} else {
+		close(workDone)
+		route("POST /api/jobs", func(r *http.Request) (int, any) {
+			var j newJob
+			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&j); err != nil {
+				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
+			}
+			if err := j.validate(); err != nil {
+				return 400, map[string]string{"error": err.Error()}
+			}
+			id, created, err := enqueue(r.Context(), pool, j)
+			var pgErr *pgconn.PgError
+			if errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22") {
+				// data exception, e.g. a NUL character in a string or an out-of-range run_at
+				return 400, map[string]string{"error": "a field has a value Postgres can't store"}
+			}
+			if err != nil {
+				slog.Error("enqueue failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			if !created {
+				return 200, map[string]any{"id": id, "duplicate": true}
+			}
+			return 201, map[string]any{"id": id}
+		})
+		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
+			var out struct {
+				ID         int64      `json:"id"`
+				Queue      string     `json:"queue"`
+				Kind       string     `json:"kind"`
+				Status     string     `json:"status"`
+				Attempts   int        `json:"attempts"`
+				WorkerID   *string    `json:"worker_id"`
+				LastError  *string    `json:"last_error"`
+				CreatedAt  time.Time  `json:"created_at"`
+				FinishedAt *time.Time `json:"finished_at"`
+			}
+			id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+			if err != nil {
+				return 400, map[string]string{"error": "id must be a number"}
+			}
+			err = pool.QueryRow(r.Context(), `SELECT id, queue, kind, status, attempts, worker_id, last_error, created_at, finished_at
+				FROM jobs WHERE id = $1`, id).
+				Scan(&out.ID, &out.Queue, &out.Kind, &out.Status, &out.Attempts, &out.WorkerID, &out.LastError, &out.CreatedAt, &out.FinishedAt)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return 404, map[string]string{"error": "not found"}
+			}
+			if err != nil {
+				slog.Error("get job failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 200, out
+		})
+	}
 	route("GET /api/hello", func(r *http.Request) (int, any) {
 		var msg *string
 		err := pool.QueryRow(r.Context(), "SELECT message FROM greetings ORDER BY id LIMIT 1").Scan(&msg)
@@ -97,10 +189,6 @@ func run() error {
 	mux.Handle("GET /metrics", promhttp.Handler())
 
 	srv := &http.Server{Addr: ":" + port(), Handler: mux, ReadHeaderTimeout: 5 * time.Second}
-	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGTERM, os.Interrupt)
-	defer stop()
-
-	errc := make(chan error, 1)
 	go func() {
 		slog.Info("listening on :" + port())
 		errc <- srv.ListenAndServe()
@@ -115,7 +203,9 @@ func run() error {
 	slog.Info("SIGTERM received, draining")
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second) // below compose stop_grace_period
 	defer cancel()
-	return srv.Shutdown(shutdownCtx)
+	err = srv.Shutdown(shutdownCtx)
+	<-workDone // the worker finishes its in-flight job first
+	return err
 }
 
 // instrument adds replica/request-id headers, JSON encoding, metrics and a request log line.

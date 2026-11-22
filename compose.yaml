@@ -48,6 +48,33 @@ services:
     mem_limit: 256m
     restart: unless-stopped
 
+  # Same image as api, run as `api worker`. Scale with `--scale worker=N`.
+  worker:
+    build: ./apps/api
+    command: ["worker"]
+    environment:
+      DATABASE_URL: *db-url
+      WORKER_QUEUES: default
+    init: true
+    stop_grace_period: 35s # a last claim + handler + complete can take 33 s, see worker.go
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    develop:
+      watch:
+        - action: rebuild
+          path: ./apps/api
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 128m
+    restart: unless-stopped
+
   db:
     image: postgres:18.6-alpine
     environment:
@@ -81,6 +108,20 @@ services:
     volumes:
       - ./infra/db/seed.sql:/seed.sql:ro
     command: ["psql", *db-url, "-v", "ON_ERROR_STOP=1", "-f", "/seed.sql"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Go tests, integration ones included, against the real db: docker compose run --rm test
+  test:
+    image: golang:1.27.4-bookworm
+    profiles: [tools]
+    working_dir: /src
+    volumes:
+      - ./apps/api:/src
+    environment:
+      DATABASE_URL: *db-url
+    command: ["sh", "-c", "go vet ./... && go test -race -count=1 -v ./..."]
     depends_on:
       migrate:
         condition: service_completed_successfully
