@@ -136,7 +136,18 @@ apart, so every worker is asleep in `LISTEN` when a job arrives. *Handled* is `f
 Postgres clock. *Round trip* is what a client sees through Caddy, from sending the POST to a polled GET that
 says `succeeded`.
 
-On an Apple M1 laptop (8 CPUs, 8 GB for Docker). **This machine was not idle:** other projects' stacks shared
+**On an idle system a job is handled 1 ms after enqueue at p50 and 2 ms at p95**, against a target of under
+50 ms. That's [one CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/44981277382) at commit `14b00b3`, with 3 workers on a GitHub-hosted `ubuntu-26.04` amd64
+runner that ran nothing else:
+
+| | p50 | p95 | p99 | max |
+|---|---|---|---|---|
+| handled | 1 ms | 2 ms | 4 ms | 7 ms |
+| round trip | 4 ms | 5 ms | 9 ms | 10 ms |
+
+The script compares whole milliseconds, so each value is ±1 ms.
+
+For comparison, under load on an Apple M1 laptop (8 CPUs, 8 GB for Docker). **This machine was not idle:** other projects' stacks shared
 the Docker VM, one of them using up to 4 cores, and the host's load average was 12–21. All eight runs:
 
 | workers | run | handled p50 | handled p95 | handled p99 | round trip p50 | round trip p95 |
@@ -150,8 +161,8 @@ the Docker VM, one of them using up to 4 cores, and the host's load average was 
 | 3 | 3 | 12 ms | 75 ms | 110 ms | 23 ms | 91 ms |
 | 3 | 4 | 7 ms | 47 ms | 111 ms | 17 ms | 81 ms |
 
-The median stayed under 50 ms in every run. The p95 went over in three of the eight. CI runs the same script
-on an otherwise idle runner and fails above 50 ms at p95.
+The median stayed under 50 ms in every run. The p95 went over in three of the eight, so under heavy CPU
+contention the target doesn't hold at p95. CI runs the same script on every PR and fails above 50 ms at p95.
 
 **HTTP, from the skeleton:** k6 with 20 virtual users for 20 s against `GET /api/hello`, which reads one row from Postgres through Caddy. Run on an Apple M1 laptop with 8 CPUs and 8 GB given to Docker, with the dev override left out:
 
