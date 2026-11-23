@@ -6,6 +6,7 @@ package main
 import (
 	"context"
 	"crypto/rand"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -125,8 +126,8 @@ func TestNoJobGoesToTwoWorkers(t *testing.T) {
 				}
 				mu.Unlock()
 				for _, j := range jobs {
-					if err := complete(ctx, db, j.ID, id, nil); err != nil {
-						t.Error(err)
+					if held, err := complete(ctx, db, j, id, nil); err != nil || !held {
+						t.Error("complete:", held, err)
 					}
 				}
 			}
@@ -333,4 +334,204 @@ func TestWorkerHandlesJob(t *testing.T) {
 		t.Fatalf("enqueue → handled took %v; NOTIFY wake-up isn't working", took)
 	}
 	t.Logf("enqueue → handled: %v", took)
+}
+
+func TestBackoff(t *testing.T) {
+	for attempt, ceiling := range map[int]time.Duration{1: 2 * time.Second, 5: 32 * time.Second, 12: time.Hour, 40: time.Hour, 1000: time.Hour} {
+		var maxSeen time.Duration
+		for range 1000 {
+			d := backoff(attempt)
+			if d < 0 || d >= ceiling {
+				t.Fatalf("attempt %d: %v outside [0, %v)", attempt, d, ceiling)
+			}
+			maxSeen = max(maxSeen, d)
+		}
+		if maxSeen < ceiling/2 { // full jitter uses the whole range
+			t.Fatalf("attempt %d: max of 1000 draws %v, want near %v", attempt, maxSeen, ceiling)
+		}
+	}
+}
+
+// claimOne claims the queue's next job, failing the test if there is none.
+func claimOne(t *testing.T, db *pgxpool.Pool, worker, q string) job {
+	t.Helper()
+	jobs, err := dequeue(context.Background(), db, worker, []string{q}, 1)
+	if err != nil || len(jobs) != 1 {
+		t.Fatalf("claim: %d jobs, %v", len(jobs), err)
+	}
+	return jobs[0]
+}
+
+func jobState(t *testing.T, db *pgxpool.Pool, id int64) (status string, attempts int, runIn time.Duration) {
+	t.Helper()
+	var secs float64
+	if err := db.QueryRow(context.Background(), `SELECT status, attempts, extract(epoch FROM run_at - now()) FROM jobs WHERE id = $1`, id).
+		Scan(&status, &attempts, &secs); err != nil {
+		t.Fatal(err)
+	}
+	return status, attempts, time.Duration(secs * float64(time.Second))
+}
+
+func TestRetriesThenDeadLetter(t *testing.T) {
+	db, q := testDB(t)
+	ctx := context.Background()
+	id, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fail := errors.New("boom")
+
+	j := claimOne(t, db, "w", q)
+	if held, err := complete(ctx, db, j, "w", fail); err != nil || !held {
+		t.Fatal(held, err)
+	}
+	status, attempts, runIn := jobState(t, db, id)
+	if status != "queued" || attempts != 1 || runIn < 0 || runIn > 2*time.Second {
+		t.Fatalf("after 1st failure: %s, %d attempts, runs in %v; want queued, 1, within the 2 s backoff", status, attempts, runIn)
+	}
+
+	db.Exec(ctx, `UPDATE jobs SET run_at = now() WHERE id = $1`, id) // skip the wait
+	j = claimOne(t, db, "w", q)
+	if held, err := complete(ctx, db, j, "w", fail); err != nil || !held {
+		t.Fatal(held, err)
+	}
+	if status, _, _ := jobState(t, db, id); status != "dead" {
+		t.Fatalf("after max_attempts failures: %s, want dead", status)
+	}
+
+	if ok, err := discardDead(ctx, db, id+1_000_000); ok || err != nil {
+		t.Fatal("discarded a job that isn't dead:", ok, err)
+	}
+	if ok, err := retryDead(ctx, db, id); !ok || err != nil {
+		t.Fatal("retry:", ok, err)
+	}
+	if status, attempts, _ := jobState(t, db, id); status != "queued" || attempts != 0 {
+		t.Fatalf("after retry: %s with %d attempts, want queued with 0", status, attempts)
+	}
+	j = claimOne(t, db, "w", q)
+	if held, err := complete(ctx, db, j, "w", nil); err != nil || !held {
+		t.Fatal(held, err)
+	}
+	if status, _, _ := jobState(t, db, id); status != "succeeded" {
+		t.Fatalf("retried job: %s, want succeeded", status)
+	}
+}
+
+func TestReaperAndFencing(t *testing.T) {
+	db, q := testDB(t)
+	ctx := context.Background()
+	id, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	expire := func() { db.Exec(ctx, `UPDATE jobs SET lease_until = now() - interval '1 s' WHERE id = $1`, id) }
+
+	zombie := claimOne(t, db, "w1", q)
+	if held, err := heartbeat(ctx, db, zombie, "w1"); !held || err != nil {
+		t.Fatal("heartbeat on a held job:", held, err)
+	}
+	expire()
+	if _, _, err := reap(ctx, db); err != nil {
+		t.Fatal(err)
+	}
+	if status, _, _ := jobState(t, db, id); status != "queued" {
+		t.Fatalf("expired lease: %s, want queued", status)
+	}
+
+	// The same worker id claims it again, as a restarted container would.
+	fresh := claimOne(t, db, "w1", q)
+	if held, _ := heartbeat(ctx, db, zombie, "w1"); held {
+		t.Fatal("the zombie's heartbeat extended a lease it lost")
+	}
+	if held, _ := complete(ctx, db, zombie, "w1", nil); held {
+		t.Fatal("the zombie completed a job it lost")
+	}
+	if status, _, _ := jobState(t, db, id); status != "running" {
+		t.Fatalf("after the zombie's writes: %s, want still running", status)
+	}
+
+	// Its lease expires on the last attempt: dead, not another loop.
+	expire()
+	if _, dead, err := reap(ctx, db); err != nil || dead < 1 {
+		t.Fatal("reap:", dead, err)
+	}
+	if status, _, _ := jobState(t, db, id); status != "dead" {
+		t.Fatalf("expired on its last attempt: %s, want dead", status)
+	}
+	if held, _ := complete(ctx, db, fresh, "w1", nil); held {
+		t.Fatal("completed a job the reaper marked dead")
+	}
+}
+
+func TestHeartbeatAbandonsLostJob(t *testing.T) {
+	db, q := testDB(t)
+	ctx := context.Background()
+	defer func(d time.Duration) { heartbeatInterval = d }(heartbeatInterval)
+	heartbeatInterval = 50 * time.Millisecond
+	id, _, _ := enqueue(ctx, db, newJob{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":10000}`), MaxAttempts: 5})
+	j := claimOne(t, db, "w", q)
+
+	done := make(chan struct{})
+	go func() { runJob(ctx, db, "w", j); close(done) }()
+	time.Sleep(100 * time.Millisecond)
+	db.Exec(ctx, `UPDATE jobs SET status = 'queued', lease_until = NULL WHERE id = $1`, id) // what the reaper does
+	select {
+	case <-done:
+	case <-time.After(2 * time.Second):
+		t.Fatal("handler kept running after its lease was taken")
+	}
+	if status, _, _ := jobState(t, db, id); status != "queued" {
+		t.Fatalf("abandoned job: %s, want left queued", status)
+	}
+}
+
+func TestGracefulShutdown(t *testing.T) {
+	db, q := testDB(t)
+	defer func(d time.Duration) { drainTimeout = d }(drainTimeout)
+	drainTimeout = 300 * time.Millisecond
+	bg := context.Background()
+	short, _, _ := enqueue(bg, db, newJob{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":100}`), MaxAttempts: 5})
+	long, _, _ := enqueue(bg, db, newJob{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":60000}`), MaxAttempts: 5})
+
+	for _, tc := range []struct {
+		id       int64
+		status   string
+		attempts int
+	}{{short, "succeeded", 1}, {long, "queued", 0}} {
+		ctx, cancel := context.WithCancel(bg)
+		j := claimOne(t, db, "w", q)
+		if j.ID != tc.id {
+			t.Fatalf("claimed %d, want %d", j.ID, tc.id)
+		}
+		done := make(chan struct{})
+		go func() { runJob(ctx, db, "w", j); close(done) }()
+		time.Sleep(20 * time.Millisecond)
+		cancel() // SIGTERM
+		select {
+		case <-done:
+		case <-time.After(3 * time.Second):
+			t.Fatal("runJob ignored the drain deadline")
+		}
+		// An in-flight job that fits the deadline finishes; one that doesn't is handed back without using an attempt.
+		if status, attempts, _ := jobState(t, db, tc.id); status != tc.status || attempts != tc.attempts {
+			t.Fatalf("job %d: %s with %d attempts, want %s with %d", tc.id, status, attempts, tc.status, tc.attempts)
+		}
+	}
+}
+
+func TestEffectRunsOnce(t *testing.T) {
+	db, q := testDB(t)
+	ctx := context.Background()
+	id, _, _ := enqueue(ctx, db, newJob{Queue: q, Kind: "effect", Payload: []byte("{}"), MaxAttempts: 5})
+	j := job{ID: id, Kind: "effect", Payload: []byte("{}")}
+	for range 3 { // at-least-once: the same job delivered three times
+		if err := handlers["effect"](ctx, db, j); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var n int
+	db.QueryRow(ctx, `SELECT count(*) FROM effects WHERE job_id = $1`, id).Scan(&n)
+	if n != 1 {
+		t.Fatalf("%d effects for one job, want 1", n)
+	}
 }
