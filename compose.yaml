@@ -75,10 +75,12 @@ services:
     mem_limit: 128m
     restart: unless-stopped
 
-  # Same image, run as `api scheduler`: the lease reaper today, cron from phase 3.
+  # Same image, run as `api scheduler`: every replica reaps expired leases, the leader also runs cron.
+  # Two replicas so a standby takes over when the leader dies (infra/scheduler-failover.sh).
   scheduler:
     build: ./apps/api
     command: ["scheduler"]
+    scale: 2
     environment:
       DATABASE_URL: *db-url
     init: true

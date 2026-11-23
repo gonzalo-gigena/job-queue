@@ -4,8 +4,9 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 2 of 8, failure handling. Jobs are enqueued, claimed and run with leases, retries with
-> backoff, a dead-letter state and graceful shutdown. Cron, workflows and the dashboard aren't built yet.
+> **Status:** phase 3 of 8, cron schedules. Jobs are enqueued, claimed and run with leases, retries with
+> backoff, a dead-letter state and graceful shutdown, and cron schedules run on a leader-elected scheduler.
+> Workflows and the dashboard aren't built yet.
 > The API, including the dead-letter actions, has no authentication yet: don't expose it publicly.
 
 ## Run it
@@ -43,6 +44,25 @@ curl localhost:8080/api/jobs/1
 | `idempotency_key` | none | 1 to 255 bytes, unique per queue |
 
 A worker runs one job at a time, for up to 5 minutes. Add workers with `--scale worker=N`.
+
+### Cron schedules
+
+```bash
+curl -X PUT localhost:8080/api/schedules/nightly-report \
+  -d '{"cron":"0 3 * * *","timezone":"Europe/Madrid","kind":"sleep","payload":{"ms":100}}'
+curl localhost:8080/api/schedules
+curl -X DELETE localhost:8080/api/schedules/nightly-report
+```
+
+`cron` is the standard 5 fields, an optional leading seconds field (`*/10 * * * * *`), or `@daily`-style
+descriptors. Times are wall-clock in `timezone` (default `UTC`), so `0 9 * * *` stays at 09:00 local across
+DST changes. `queue`, `kind` and `payload` are as for a job; `"enabled": false` pauses a schedule.
+
+Two `scheduler` replicas run; the one holding `pg_try_advisory_lock` on a direct connection is the leader and
+checks schedules every second. If it dies, Postgres closes its session, the lock frees, and the standby takes
+over within about a second. Each run is enqueued with the idempotency key `schedule_id:time`, and runs missed
+while no leader was up are enqueued on takeover (up to 100 per schedule per tick), so a failover neither skips
+nor duplicates a run.
 
 ### When things fail
 
@@ -86,6 +106,7 @@ id as the provider's idempotency key instead.
 | SQL shell | `docker compose exec db psql -U app app` |
 | Scale the api | `docker compose up -d --scale api=3` |
 | Scale the workers | `docker compose up -d --scale worker=3`, check with `sh infra/worker-smoke.sh 3` |
+| Scheduler failover drill | `sh infra/scheduler-failover.sh` (SIGKILLs the leader) |
 | Chaos test: kill workers mid-run | `sh infra/chaos-test.sh 4` (10,000 jobs, about 1–4 minutes) |
 | Lint migrations | `sh common/scripts/check-migrations.sh` |
 | Measure enqueue → handled | `docker compose --profile loadtest run --rm k6 run /scripts/latency.js` |
@@ -108,7 +129,7 @@ flowchart LR
     caddy["Caddy :8080"]
     api["api ×N<br/>enqueue, admin, live updates"]
     worker["worker ×N"]
-    sched["scheduler<br/>lease reaper, cron later"]
+    sched["scheduler ×2<br/>lease reaper, cron leader"]
     db[("Postgres<br/>jobs, schedules, workflows")]
   end
   browser --> caddy
@@ -116,7 +137,7 @@ flowchart LR
   caddy --> api
   api --> db
   worker -->|"claim: FOR UPDATE SKIP LOCKED<br/>wake: LISTEN/NOTIFY"| db
-  sched -->|"requeue expired leases"| db
+  sched -->|"requeue expired leases<br/>cron: advisory-lock leader"| db
   class app planned
   classDef planned stroke-dasharray: 5 5
 ```
@@ -130,8 +151,9 @@ Postgres is the only stateful service. Workers claim jobs with `FOR UPDATE SKIP 
 - **api:** Go 1.27 (`net/http` + `pgx` + Prometheus client), distroless runtime image. Stateless, so it scales with `--scale api=N`.
 - **worker:** the same binary run as `api worker`. It has one direct connection for `LISTEN` (`DIRECT_DATABASE_URL`,
   which defaults to `DATABASE_URL`) and a pool for everything else.
-- **scheduler:** the same binary run as `api scheduler`. Today it runs the lease reaper. Phase 3 adds cron and
-  a second replica with leader election; the reaper is already safe to run on several replicas at once.
+- **scheduler:** the same binary run as `api scheduler`, two replicas. Both run the lease reaper (safe
+  concurrently); the advisory-lock leader also runs cron. Timezones are embedded (`time/tzdata`), since the
+  distroless image has no zoneinfo.
 - **Caddy:** the only service with a host port. It load-balances `/api/*` across every
   replica (`import lb api 8080`, from common) and serves `apps/web`.
 - **Postgres 18:** migrations run once before the api starts (`golang-migrate`).
@@ -161,7 +183,9 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Retries | Exponential backoff with full jitter, `min(1 h, 1 s·2^attempt)·rand()`, then `dead` | A fixed delay | Jitter stops failed jobs from retrying in lockstep against a struggling dependency. A crash uses an attempt too, so a job that kills its worker ends in `dead`. |
 | Shutdown | Stop claiming, 25 s to finish, then cancel and release the job, giving the attempt back | Waiting for the job, or dropping it | Inside compose's 35 s grace period, so the job is handed back rather than left for the reaper. A deploy doesn't push a job toward `dead`. |
 | Reaper | One `UPDATE … SKIP LOCKED` on a partial index of running jobs, on every scheduler replica | Only the leader reaps | Concurrent reapers each take different rows, so it needs no leader. The index only holds running jobs, so it stays tiny however large `jobs` grows. |
-| Scheduler leader | `pg_try_advisory_lock` on a direct connection | etcd or Raft, or one scheduler | If the leader dies, its connection closes and the lock frees. Each run's idempotency key (`schedule_id:time`) makes a brief two-leader overlap harmless. |
+| Scheduler leader | `pg_try_advisory_lock` on a direct connection, standbys retry every 1 s | etcd or Raft, or one scheduler | If the leader dies, its connection closes and the lock frees: the CI drill SIGKILLs the leader container and the standby leads 1 s later. Each run's idempotency key (`schedule_id:time`) and `FOR UPDATE SKIP LOCKED` on the schedule row make a brief two-leader overlap harmless. Cost: a leader cut off by a network partition (not killed) holds the lock until TCP notices. |
+| Missed cron runs | Enqueue every missed run on takeover, 100 per schedule per tick | Skip to the next future run | The failover test demands no skipped run. Cost: after a long outage a minutely schedule fires a burst of catch-up jobs; disable it first if that's wrong for the job. |
+| Cron library | `robfig/cron/v3` evaluated in the schedule's `time.Location` | Computing in UTC | Wall-clock schedules keep their local hour across DST (tested on New York's 2026 spring-forward). |
 | Workflow fan-in | Mark the step done and enqueue its children in one transaction, holding the run's row lock | Separate updates | Without the lock, two parents finishing at once each see the other still running, and the child never starts. |
 | Packaging | One Go binary with `api`, `worker` and `scheduler` subcommands | A separate image per role | One Dockerfile, one image, and the same version everywhere. |
 | Load balancing | Caddy `dynamic a` upstreams (the `lb` snippet in `common/`) | `reverse_proxy api:8080`, Traefik | Caddy re-reads Docker DNS every 5 s, so `--scale api=N` needs no config change and no Docker socket mount. A plain `reverse_proxy api:8080` is a single upstream to Caddy and doesn't reliably spread load. |
@@ -233,7 +257,7 @@ run twice. CI runs it on every PR and fails on any duplicate or lost job.
 |---|---|---|
 | `api` | `--scale api=N` (stateless) | Postgres connections |
 | `worker` | `--scale worker=N`, one job at a time each | Throughput grows until Postgres saturates. Phase 5 adds per-queue concurrency and rate limits that hold across replicas. |
-| `scheduler` | 1 replica today; phase 3 runs 2 with one leader | The reaper can run on every replica. For cron, only the leader works and the standby takes over within ~5 s. |
+| `scheduler` | 2 replicas, one leader | The reaper runs on every replica. For cron, only the leader works and the standby takes over in about 1 s. |
 | Postgres | One primary | The ceiling for the whole system |
 
 ### Where it breaks next

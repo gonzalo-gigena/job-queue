@@ -234,7 +234,7 @@ func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) 
 }
 
 // reapLoop runs the reaper every reapInterval until ctx is cancelled.
-// ponytail: every scheduler replica reaps; that's safe (SKIP LOCKED). Phase 3 adds a leader for cron.
+// Every scheduler replica reaps, not only the leader: that is safe (SKIP LOCKED) and needs no failover.
 func reapLoop(ctx context.Context, db *pgxpool.Pool) {
 	slog.Info("reaper started")
 	for {
