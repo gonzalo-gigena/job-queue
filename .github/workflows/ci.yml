@@ -13,7 +13,9 @@ jobs:
         with:
           submodules: true # common/ (portfolio-common must be public, same owner)
       - run: cp .env.example .env
-      - name: Tests against real Postgres (idempotent enqueue, no job handed to two workers)
+      - name: Migrations follow the lock rules
+        run: sh common/scripts/check-migrations.sh
+      - name: Tests against real Postgres (claims, retries, leases, fencing, graceful shutdown)
         run: docker compose -f compose.yaml run --rm test
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
@@ -23,6 +25,8 @@ jobs:
           sh infra/worker-smoke.sh 3
       - name: Enqueue to handled under 50 ms (p95, idle queue)
         run: docker compose -f compose.yaml --profile loadtest run --rm k6 run --quiet /scripts/latency.js
+      - name: "Chaos test: 10,000 jobs while every worker is SIGKILLed at random"
+        run: sh infra/chaos-test.sh 4
       - name: Logs
         if: failure()
         run: docker compose -f compose.yaml logs --tail=200

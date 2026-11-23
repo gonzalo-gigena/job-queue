@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"math/rand/v2"
 	"regexp"
 	"time"
 
@@ -102,13 +103,13 @@ func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []st
 	}
 	rows, err := db.Query(ctx, `
 		UPDATE jobs SET status = 'running', attempts = attempts + 1,
-		       lease_until = now() + interval '30 s', worker_id = $1
+		       lease_until = now() + interval '1 ms' * $4, worker_id = $1
 		WHERE id = ANY(ARRAY(
 		  SELECT id FROM jobs
 		  WHERE `+match+` AND status = 'queued' AND run_at <= now()
 		  ORDER BY priority DESC, run_at
 		  FOR UPDATE SKIP LOCKED LIMIT $3))
-		RETURNING id, kind, payload, attempts`, workerID, arg, limit)
+		RETURNING id, kind, payload, attempts`, workerID, arg, limit, leaseDuration.Milliseconds())
 	if err != nil {
 		return nil, err
 	}
@@ -119,16 +120,111 @@ func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []st
 	})
 }
 
-// complete records the outcome, but only if this worker still holds the job.
-// ponytail: a failed job stays failed; retries with backoff and the dead state come in phase 2.
-func complete(ctx context.Context, db *pgxpool.Pool, id int64, workerID string, jobErr error) error {
-	status, lastErr := "succeeded", (*string)(nil)
+// A job's lease. The worker extends it every heartbeatInterval; the reaper requeues jobs
+// whose lease ran out, which means their worker died or lost touch with Postgres.
+const (
+	leaseDuration = 30 * time.Second
+	backoffBase   = time.Second
+	backoffCap    = time.Hour
+)
+
+var heartbeatInterval = 10 * time.Second // a var so tests can shorten it
+
+// backoff is exponential with full jitter: uniform in [0, min(cap, base·2^attempt)).
+// Jitter spreads retries so jobs that failed together don't retry in lockstep.
+func backoff(attempt int) time.Duration {
+	ceiling := backoffCap
+	if attempt < 32 && backoffBase<<attempt < backoffCap { // the shift overflows past ~2^33 s
+		ceiling = backoffBase << attempt
+	}
+	return rand.N(ceiling)
+}
+
+// Fencing: every write a worker makes to its job matches (id, worker_id, attempts).
+// attempts goes up on each claim, so it is a fencing token: a worker that lost its lease
+// (paused, partitioned) can't touch the job after someone else claimed it, even when the
+// new claimer has the same worker_id because it is the same container restarted.
+const fence = `id = $1 AND worker_id = $2 AND attempts = $3 AND status = 'running'`
+
+// complete records the outcome if this worker still holds the job. A failed job goes back
+// to queued with a backoff, or to dead once it has used max_attempts. It returns false
+// when the lease was lost, in which case the outcome is dropped: the job runs again.
+func complete(ctx context.Context, db *pgxpool.Pool, j job, workerID string, jobErr error) (bool, error) {
+	var lastErr *string
 	if jobErr != nil {
 		msg := jobErr.Error()
-		status, lastErr = "failed", &msg
+		lastErr = &msg
 	}
+	tag, err := db.Exec(ctx, `
+		UPDATE jobs SET
+		  status = CASE WHEN $4::text IS NULL THEN 'succeeded' WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+		  run_at = CASE WHEN $4::text IS NOT NULL AND attempts < max_attempts THEN now() + $5 * interval '1 ms' ELSE run_at END,
+		  finished_at = CASE WHEN $4::text IS NULL OR attempts >= max_attempts THEN clock_timestamp() END,
+		  last_error = coalesce($4, last_error), lease_until = NULL
+		WHERE `+fence, j.ID, workerID, j.Attempts, lastErr, backoff(j.Attempts).Milliseconds())
+	return tag.RowsAffected() == 1, err
+}
+
+// heartbeat extends the lease. false means the job was taken away: abandon it.
+func heartbeat(ctx context.Context, db *pgxpool.Pool, j job, workerID string) (bool, error) {
+	tag, err := db.Exec(ctx, `UPDATE jobs SET lease_until = now() + $4 * interval '1 ms' WHERE `+fence,
+		j.ID, workerID, j.Attempts, leaseDuration.Milliseconds())
+	return tag.RowsAffected() == 1, err
+}
+
+// release hands a job back on graceful shutdown. The attempt is given back too: a deploy
+// isn't the job's fault, and shouldn't push it toward dead.
+func release(ctx context.Context, db *pgxpool.Pool, j job, workerID string) error {
 	_, err := db.Exec(ctx, `
-		UPDATE jobs SET status = $3, last_error = $4, finished_at = clock_timestamp(), lease_until = NULL
-		WHERE id = $1 AND worker_id = $2 AND status = 'running'`, id, workerID, status, lastErr)
+		UPDATE jobs SET status = 'queued', attempts = attempts - 1, run_at = now(), lease_until = NULL
+		WHERE `+fence, j.ID, workerID, j.Attempts)
 	return err
+}
+
+// reap requeues running jobs whose lease expired, or marks them dead once they have used
+// max_attempts, so a job that keeps crashing its worker can't loop forever. Safe to run from
+// several replicas at once: SKIP LOCKED gives each expired job to one of them.
+// ponytail: requeued jobs aren't NOTIFYed; workers find them on their next 1 s poll.
+func reap(ctx context.Context, db *pgxpool.Pool) (requeued, dead int, err error) {
+	err = db.QueryRow(ctx, `
+		WITH r AS (
+		  UPDATE jobs SET
+		    status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+		    finished_at = CASE WHEN attempts >= max_attempts THEN clock_timestamp() END,
+		    last_error = 'lease expired: worker died or lost its connection',
+		    run_at = now(), lease_until = NULL
+		  WHERE id = ANY(ARRAY(
+		    SELECT id FROM jobs WHERE status = 'running' AND lease_until < now()
+		    FOR UPDATE SKIP LOCKED LIMIT 1000))
+		  RETURNING status)
+		SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status = 'dead') FROM r`).
+		Scan(&requeued, &dead)
+	return requeued, dead, err
+}
+
+// retryDead puts a dead job back in its queue with a fresh set of attempts.
+func retryDead(ctx context.Context, db *pgxpool.Pool, id int64) (bool, error) {
+	var ok bool
+	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		var queue string
+		err := tx.QueryRow(ctx, `
+			UPDATE jobs SET status = 'queued', attempts = 0, run_at = now(), finished_at = NULL
+			WHERE id = $1 AND status = 'dead' RETURNING queue`, id).Scan(&queue)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		ok = true
+		_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, "jobs_"+queue)
+		return err
+	})
+	return ok, err
+}
+
+// discardDead gives up on a dead job. It stays in the table as cancelled, for the record.
+func discardDead(ctx context.Context, db *pgxpool.Pool, id int64) (bool, error) {
+	tag, err := db.Exec(ctx, `UPDATE jobs SET status = 'cancelled' WHERE id = $1 AND status = 'dead'`, id)
+	return tag.RowsAffected() == 1, err
 }

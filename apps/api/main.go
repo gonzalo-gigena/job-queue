@@ -2,6 +2,7 @@
 //
 //	api              stateless HTTP service: enqueue and query jobs
 //	api worker       claims and runs jobs (WORKER_QUEUES, default "default")
+//	api scheduler    requeues jobs whose lease expired (cron comes in phase 3)
 //	api healthcheck  lets the distroless image check itself
 package main
 
@@ -40,8 +41,15 @@ func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
 		os.Exit(healthcheck())
 	}
-	worker := len(os.Args) > 1 && os.Args[1] == "worker"
-	if err := run(worker); err != nil {
+	role := "api"
+	if len(os.Args) > 1 {
+		role = os.Args[1]
+	}
+	if role != "api" && role != "worker" && role != "scheduler" {
+		fmt.Fprintln(os.Stderr, "usage: api [worker|scheduler|healthcheck]")
+		os.Exit(2)
+	}
+	if err := run(role); err != nil {
 		slog.Error("fatal", "err", err)
 		os.Exit(1)
 	}
@@ -70,7 +78,7 @@ func healthcheck() int {
 	return 0
 }
 
-func run(worker bool) error {
+func run(role string) error {
 	replica, _ := os.Hostname()
 	slog.SetDefault(slog.New(slog.NewJSONHandler(os.Stdout, nil)).With("replica", replica))
 
@@ -102,7 +110,10 @@ func run(worker bool) error {
 		}
 		return 200, map[string]bool{"ok": true}
 	})
-	if worker {
+	switch role {
+	case "scheduler":
+		go func() { defer close(workDone); reapLoop(ctx, pool) }()
+	case "worker":
 		queues := splitQueues(envOr("WORKER_QUEUES", "default"))
 		if len(queues) == 0 {
 			return errors.New("WORKER_QUEUES lists no queue")
@@ -120,7 +131,7 @@ func run(worker bool) error {
 				errc <- err
 			}
 		}()
-	} else {
+	default:
 		close(workDone)
 		route("POST /api/jobs", func(r *http.Request) (int, any) {
 			var j newJob
@@ -147,6 +158,24 @@ func run(worker bool) error {
 			}
 			return 201, map[string]any{"id": id}
 		})
+		// Dead-letter actions for the dashboard. ponytail: unauthenticated like the rest of the API; phase 6 adds a token.
+		for action, fn := range map[string]func(context.Context, *pgxpool.Pool, int64) (bool, error){"retry": retryDead, "discard": discardDead} {
+			route("POST /api/jobs/{id}/"+action, func(r *http.Request) (int, any) {
+				id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+				if err != nil {
+					return 400, map[string]string{"error": "id must be a number"}
+				}
+				ok, err := fn(r.Context(), pool, id)
+				if err != nil {
+					slog.Error(action+" failed", "err", err)
+					return 500, map[string]string{"error": "internal error"}
+				}
+				if !ok {
+					return 409, map[string]string{"error": "no dead job with that id"}
+				}
+				return 200, map[string]any{"id": id}
+			})
+		}
 		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
 			var out struct {
 				ID         int64      `json:"id"`
@@ -156,6 +185,7 @@ func run(worker bool) error {
 				Attempts   int        `json:"attempts"`
 				WorkerID   *string    `json:"worker_id"`
 				LastError  *string    `json:"last_error"`
+				RunAt      time.Time  `json:"run_at"`
 				CreatedAt  time.Time  `json:"created_at"`
 				FinishedAt *time.Time `json:"finished_at"`
 			}
@@ -163,9 +193,9 @@ func run(worker bool) error {
 			if err != nil {
 				return 400, map[string]string{"error": "id must be a number"}
 			}
-			err = pool.QueryRow(r.Context(), `SELECT id, queue, kind, status, attempts, worker_id, last_error, created_at, finished_at
+			err = pool.QueryRow(r.Context(), `SELECT id, queue, kind, status, attempts, worker_id, last_error, run_at, created_at, finished_at
 				FROM jobs WHERE id = $1`, id).
-				Scan(&out.ID, &out.Queue, &out.Kind, &out.Status, &out.Attempts, &out.WorkerID, &out.LastError, &out.CreatedAt, &out.FinishedAt)
+				Scan(&out.ID, &out.Queue, &out.Kind, &out.Status, &out.Attempts, &out.WorkerID, &out.LastError, &out.RunAt, &out.CreatedAt, &out.FinishedAt)
 			if errors.Is(err, pgx.ErrNoRows) {
 				return 404, map[string]string{"error": "not found"}
 			}
