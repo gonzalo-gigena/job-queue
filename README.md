@@ -4,9 +4,9 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 1 of 8, the core queue. Jobs can be enqueued, claimed and run. Retries, the lease
-> reaper, cron, workflows and the dashboard aren't built yet, so a job whose worker crashes stays `running`
-> until phase 2 adds the reaper. The API has no authentication yet: don't expose it publicly.
+> **Status:** phase 2 of 8, failure handling. Jobs are enqueued, claimed and run with leases, retries with
+> backoff, a dead-letter state and graceful shutdown. Cron, workflows and the dashboard aren't built yet.
+> The API, including the dead-letter actions, has no authentication yet: don't expose it publicly.
 
 ## Run it
 
@@ -34,15 +34,49 @@ curl localhost:8080/api/jobs/1
 
 | Field | Default | Notes |
 |---|---|---|
-| `kind` | required | Built in: `noop`, and `sleep` with `{"ms":…}`. An unknown kind fails the job. |
+| `kind` | required | Built in: `noop`, `sleep` with `{"ms":…}`, and `effect` (the idempotent pattern below; `{"fail":true}` always fails). An unknown kind fails the job. |
 | `payload` | `{}` | Any JSON, up to 1 MB |
 | `queue` | `default` | `[a-z0-9_]`, up to 50 characters. Workers serve the queues in `WORKER_QUEUES`. |
 | `priority` | `0` | Higher runs first |
 | `run_at` | now | RFC 3339 time. A future job starts within about 1 s of it (the poll interval). |
-| `max_attempts` | `5` | Stored now, used by phase 2's retries |
+| `max_attempts` | `5` | Runs before the job is `dead`, counting crashes |
 | `idempotency_key` | none | 1 to 255 bytes, unique per queue |
 
-A worker runs one job at a time, for up to 24 s. Add workers with `--scale worker=N`.
+A worker runs one job at a time, for up to 5 minutes. Add workers with `--scale worker=N`.
+
+### When things fail
+
+Delivery is **at-least-once**: a job can run more than once, so handlers must be idempotent.
+
+- **Handler error:** the job goes back to `queued` with a backoff, `run_at = now() + min(1 h, 1 s·2^attempt)·rand()`,
+  and to `dead` after `max_attempts` runs. `last_error` keeps the latest error.
+- **Worker crash:** a claim is a 30 s lease, and the worker extends it every 10 s. The `scheduler`'s reaper
+  checks every 5 s and puts jobs whose lease expired back to `queued`, or to `dead` if that was their last
+  attempt, so a job that crashes its worker can't loop forever. A crashed worker's job restarts 30–35 s later.
+- **Zombie worker** (paused, or cut off from Postgres while its lease expired): every write it makes to the job
+  checks `(id, worker_id, attempts)`. Once the job was reclaimed, those writes change 0 rows, the worker abandons
+  the job, and its result is dropped.
+- **Deploy (SIGTERM):** the worker stops claiming, gives the in-flight job up to 25 s to finish, then cancels it
+  and hands it back to `queued` without using up an attempt.
+- **Dead jobs:** `POST /api/jobs/{id}/retry` requeues one with fresh attempts; `POST /api/jobs/{id}/discard`
+  marks it `cancelled`. The phase 6 dashboard calls these.
+
+The idempotent pattern, as the `effect` kind does it: record the job in `processed` in the same transaction
+as the side effect, and skip the side effect if it is already there.
+
+```go
+pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+	tag, err := tx.Exec(ctx, `INSERT INTO processed (job_id) VALUES ($1) ON CONFLICT DO NOTHING`, j.ID)
+	if err != nil || tag.RowsAffected() == 0 {
+		return err // an earlier run already did it
+	}
+	_, err = tx.Exec(ctx, `INSERT INTO effects (job_id) VALUES ($1)`, j.ID) // the side effect
+	return err
+})
+```
+
+This works when the side effect is in the same database. For an external call (email, payment), pass the job
+id as the provider's idempotency key instead.
 
 ## Everyday commands
 
@@ -52,13 +86,15 @@ A worker runs one job at a time, for up to 24 s. Add workers with `--scale worke
 | SQL shell | `docker compose exec db psql -U app app` |
 | Scale the api | `docker compose up -d --scale api=3` |
 | Scale the workers | `docker compose up -d --scale worker=3`, check with `sh infra/worker-smoke.sh 3` |
+| Chaos test: kill workers mid-run | `sh infra/chaos-test.sh 4` (10,000 jobs, about 1–4 minutes) |
+| Lint migrations | `sh common/scripts/check-migrations.sh` |
 | Measure enqueue → handled | `docker compose --profile loadtest run --rm k6 run /scripts/latency.js` |
 | Prove scaling works | `sh common/scripts/smoke.sh 3` |
 | The api replica check from CI | `sh common/scripts/ci-stack.sh 3` (ends with `down -v`) |
 | Load test at 1, 2, 4 replicas | `sh common/scripts/scale.sh` |
 | Metrics (Prometheus) | `docker compose --profile observability up -d`, then http://localhost:9090 |
 | Tests, against real Postgres | `docker compose run --rm test` |
-| New migration | add `infra/db/migrations/00000N_name.up.sql` + `.down.sql`, restart |
+| New migration | add `infra/db/migrations/00000N_name.up.sql` + `.down.sql` (start with `SET lock_timeout`; `CONCURRENTLY` alone in its file), restart |
 | Update shared code | `git submodule update --remote common` |
 | Reset everything | `docker compose down -v` |
 
@@ -72,7 +108,7 @@ flowchart LR
     caddy["Caddy :8080"]
     api["api ×N<br/>enqueue, admin, live updates"]
     worker["worker ×N"]
-    sched["scheduler ×2<br/>cron + lease reaper, one leader"]
+    sched["scheduler<br/>lease reaper, cron later"]
     db[("Postgres<br/>jobs, schedules, workflows")]
   end
   browser --> caddy
@@ -80,8 +116,8 @@ flowchart LR
   caddy --> api
   api --> db
   worker -->|"claim: FOR UPDATE SKIP LOCKED<br/>wake: LISTEN/NOTIFY"| db
-  sched -.->|"leader: advisory lock"| db
-  class app,sched planned
+  sched -->|"requeue expired leases"| db
+  class app planned
   classDef planned stroke-dasharray: 5 5
 ```
 
@@ -94,6 +130,8 @@ Postgres is the only stateful service. Workers claim jobs with `FOR UPDATE SKIP 
 - **api:** Go 1.27 (`net/http` + `pgx` + Prometheus client), distroless runtime image. Stateless, so it scales with `--scale api=N`.
 - **worker:** the same binary run as `api worker`. It has one direct connection for `LISTEN` (`DIRECT_DATABASE_URL`,
   which defaults to `DATABASE_URL`) and a pool for everything else.
+- **scheduler:** the same binary run as `api scheduler`. Today it runs the lease reaper. Phase 3 adds cron and
+  a second replica with leader election; the reaper is already safe to run on several replicas at once.
 - **Caddy:** the only service with a host port. It load-balances `/api/*` across every
   replica (`import lb api 8080`, from common) and serves `apps/web`.
 - **Postgres 18:** migrations run once before the api starts (`golang-migrate`).
@@ -117,8 +155,12 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Claiming jobs | One `UPDATE … WHERE id = ANY(ARRAY(SELECT … FOR UPDATE SKIP LOCKED LIMIT n))` | `SELECT` then `UPDATE`, an advisory lock per job, or the common `id IN (SELECT …)` | One round trip, and concurrent workers skip rows another worker holds instead of queueing behind them. `IN` looks the same, but Postgres may re-scan it and lock more rows each time: on 18 it claimed 5 jobs with `LIMIT 1`. `ARRAY(…)` is evaluated once. |
 | Dequeue index | `queue = $1` when a worker serves one queue | Always `queue = ANY($1)` | With `ANY`, Postgres sorts every queued row on each claim (about 12 ms at 50,000 queued) instead of reading the partial index in order (under 1 ms). Cost: a worker with several queues still pays for the sort. |
 | Waking workers | `LISTEN/NOTIFY` in the enqueue transaction, plus a 1 s poll | Polling only | Jobs start within milliseconds, and polling catches a missed notification. Cost: `LISTEN` needs a direct connection per worker, not PgBouncer. |
-| Delivery guarantee | At-least-once, with leases and a heartbeat | Claiming exactly-once | Exactly-once isn't possible once a worker can die mid-job. Leases fence out zombie workers, and handlers must be idempotent: write a `processed(job_id)` row in the same transaction as the side effect. |
-| Retries | Exponential backoff with full jitter, then a dead-letter state | A fixed delay | Jitter stops failed jobs from retrying in lockstep against a struggling dependency. |
+| Delivery guarantee | At-least-once, with leases and a heartbeat | Claiming exactly-once | Exactly-once isn't possible once a worker can die mid-job. Leases fence out zombie workers, and handlers must be idempotent: write a `processed(job_id)` row in the same transaction as the side effect. The chaos test kills every worker 8 times during 10,000 jobs and still gets exactly 10,000 effects. |
+| Fencing token | `attempts`, checked with `worker_id` on every heartbeat and completion | `worker_id` alone | A worker's id is its hostname, and a restarted container keeps it. With `worker_id` alone, a zombie could complete the job its own restarted replica had just reclaimed. `attempts` goes up on every claim, so it is never reused. |
+| Lease length | 30 s lease, 10 s heartbeat, reaper every 5 s | A short lease without heartbeats | A heartbeat lets a job run longer than its lease, and two missed beats are tolerated. Cost: a crashed worker's job waits 30–35 s before it runs again. |
+| Retries | Exponential backoff with full jitter, `min(1 h, 1 s·2^attempt)·rand()`, then `dead` | A fixed delay | Jitter stops failed jobs from retrying in lockstep against a struggling dependency. A crash uses an attempt too, so a job that kills its worker ends in `dead`. |
+| Shutdown | Stop claiming, 25 s to finish, then cancel and release the job, giving the attempt back | Waiting for the job, or dropping it | Inside compose's 35 s grace period, so the job is handed back rather than left for the reaper. A deploy doesn't push a job toward `dead`. |
+| Reaper | One `UPDATE … SKIP LOCKED` on a partial index of running jobs, on every scheduler replica | Only the leader reaps | Concurrent reapers each take different rows, so it needs no leader. The index only holds running jobs, so it stays tiny however large `jobs` grows. |
 | Scheduler leader | `pg_try_advisory_lock` on a direct connection | etcd or Raft, or one scheduler | If the leader dies, its connection closes and the lock frees. Each run's idempotency key (`schedule_id:time`) makes a brief two-leader overlap harmless. |
 | Workflow fan-in | Mark the step done and enqueue its children in one transaction, holding the run's row lock | Separate updates | Without the lock, two parents finishing at once each see the other still running, and the child never starts. |
 | Packaging | One Go binary with `api`, `worker` and `scheduler` subcommands | A separate image per role | One Dockerfile, one image, and the same version everywhere. |
@@ -178,13 +220,20 @@ COMPOSE_FILE=compose.yaml sh common/scripts/scale.sh
 
 4 replicas served 1.1× the requests of 1. One Go process already spreads across every core, and the run shares 8 CPUs with Caddy, Postgres and k6, so on one machine extra api replicas buy redundancy, not throughput. Replica counts matter for `worker`, which phase 7 measures.
 
+**Chaos test.** `infra/chaos-test.sh 4` inserts 10,000 `effect` jobs (each sleeps 10 ms after its side effect)
+for 4 workers, then 8 times waits 2–6 s, SIGKILLs every worker and restarts them 0–2 s later. In
+[one CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/45093265380) at commit `b52ac04`: all 10,000
+succeeded in 86 s, `effects` had exactly 10,000 rows, nothing was left `running`, and 27 jobs ran twice, all 27
+requeued by the reaper after their lease expired. On the shared M1 laptop the same test took 211 s, with 18 jobs
+run twice. CI runs it on every PR and fails on any duplicate or lost job.
+
 ### How each part scales
 
 | Part | Scales by | Limit |
 |---|---|---|
 | `api` | `--scale api=N` (stateless) | Postgres connections |
 | `worker` | `--scale worker=N`, one job at a time each | Throughput grows until Postgres saturates. Phase 5 adds per-queue concurrency and rate limits that hold across replicas. |
-| `scheduler` | 2 replicas, one leader | Only the leader works. The standby takes over within ~5 s. |
+| `scheduler` | 1 replica today; phase 3 runs 2 with one leader | The reaper can run on every replica. For cron, only the leader works and the standby takes over within ~5 s. |
 | Postgres | One primary | The ceiling for the whole system |
 
 ### Where it breaks next

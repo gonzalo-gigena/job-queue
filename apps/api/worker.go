@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -17,28 +18,70 @@ import (
 var jobsDone = promauto.NewCounterVec(prometheus.CounterOpts{Name: "jobs_done_total", Help: "Jobs a worker finished."}, []string{"kind", "status"})
 
 // handlers maps a job kind to its code. Handlers must be idempotent: delivery is at-least-once.
-var handlers = map[string]func(ctx context.Context, payload json.RawMessage) error{
-	"noop": func(context.Context, json.RawMessage) error { return nil },
-	"sleep": func(ctx context.Context, p json.RawMessage) error {
+// They should return soon after ctx is cancelled (lease lost, shutdown deadline, timeout).
+var handlers = map[string]func(ctx context.Context, db *pgxpool.Pool, j job) error{
+	"noop": func(context.Context, *pgxpool.Pool, job) error { return nil },
+	"sleep": func(ctx context.Context, _ *pgxpool.Pool, j job) error {
 		var a struct{ MS int }
-		if err := json.Unmarshal(p, &a); err != nil {
+		if err := json.Unmarshal(j.Payload, &a); err != nil {
 			return err
 		}
-		select {
-		case <-time.After(time.Duration(a.MS) * time.Millisecond):
-			return nil
-		case <-ctx.Done():
-			return ctx.Err()
+		return sleep(ctx, time.Duration(a.MS)*time.Millisecond)
+	},
+	// effect is the idempotent-handler pattern: the side effect (a row in effects) and the
+	// processed(job_id) marker commit together, so a second run finds the marker and skips.
+	// {"ms":…} sleeps after the commit, widening the window where a crash forces a re-run.
+	// {"fail":true} always errors, to exercise retries and the dead state.
+	"effect": func(ctx context.Context, db *pgxpool.Pool, j job) error {
+		var a struct {
+			MS   int
+			Fail bool
 		}
+		if err := json.Unmarshal(j.Payload, &a); err != nil {
+			return err
+		}
+		if a.Fail {
+			return errors.New("asked to fail")
+		}
+		err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+			tag, err := tx.Exec(ctx, `INSERT INTO processed (job_id) VALUES ($1) ON CONFLICT DO NOTHING`, j.ID)
+			if err != nil || tag.RowsAffected() == 0 {
+				return err // already done by an earlier run
+			}
+			_, err = tx.Exec(ctx, `INSERT INTO effects (job_id) VALUES ($1)`, j.ID)
+			return err
+		})
+		if err != nil {
+			return err
+		}
+		return sleep(ctx, time.Duration(a.MS)*time.Millisecond)
 	},
 }
 
+func sleep(ctx context.Context, d time.Duration) error {
+	select {
+	case <-time.After(d):
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// After SIGTERM, how long an in-flight job may keep running. A var so tests can shorten it.
+var drainTimeout = 25 * time.Second
+
+var (
+	errLeaseLost = errors.New("lease lost: the job was taken away")
+	errShutdown  = errors.New("shutdown deadline: job released")
+)
+
 const (
 	pollInterval = time.Second // fallback: a run_at came due, or a NOTIFY was missed
-	// Together these stay inside compose's stop_grace_period, and handler + complete inside the 30 s lease.
-	claimTimeout    = 5 * time.Second
-	handlerTimeout  = 24 * time.Second
-	completeTimeout = 4 * time.Second
+	reapInterval = 5 * time.Second
+	// claimTimeout + drainTimeout + dbTimeout stay inside compose's 35 s stop_grace_period.
+	claimTimeout   = 5 * time.Second
+	dbTimeout      = 4 * time.Second // complete, release, heartbeat
+	handlerTimeout = 5 * time.Minute // heartbeats keep the lease, so this is only a hang guard
 )
 
 // work claims and runs jobs until ctx is cancelled. It wakes on NOTIFY jobs_<queue>
@@ -103,17 +146,49 @@ func work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, que
 			continue
 		}
 		for _, j := range jobs {
-			runJob(db, workerID, j)
+			runJob(ctx, db, workerID, j)
 		}
 	}
 	return nil
 }
 
-// runJob executes one job and records the outcome. It ignores the shutdown signal so an
-// in-flight job finishes instead of being cut off halfway.
-func runJob(db *pgxpool.Pool, workerID string, j job) {
+// runJob executes one job and records the outcome. While the handler runs, a heartbeat
+// extends the lease and abandons the job if it was taken away. On shutdown the job gets
+// drainTimeout to finish, then it is cancelled and its lease released.
+func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) {
 	ctx, cancel := context.WithTimeout(context.Background(), handlerTimeout)
 	defer cancel()
+	ctx, abandon := context.WithCancelCause(ctx)
+	defer abandon(nil)
+	watching := make(chan struct{})
+	go func() {
+		defer close(watching)
+		t := time.NewTicker(heartbeatInterval)
+		defer t.Stop()
+		var drain <-chan time.Time
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-shutdown.Done():
+				drain, shutdown = time.After(drainTimeout), context.Background() // fire once
+			case <-drain:
+				abandon(errShutdown)
+				return
+			case <-t.C:
+				hbCtx, c := context.WithTimeout(ctx, dbTimeout)
+				held, err := heartbeat(hbCtx, db, j, workerID)
+				c()
+				if err != nil {
+					slog.Warn("heartbeat failed", "job", j.ID, "err", err) // retry next tick; the lease has 20 s left
+				} else if !held {
+					abandon(errLeaseLost)
+					return
+				}
+			}
+		}
+	}()
+
 	label := j.Kind
 	h, ok := handlers[j.Kind]
 	var err error
@@ -121,21 +196,62 @@ func runJob(db *pgxpool.Pool, workerID string, j job) {
 		err = fmt.Errorf("no handler for kind %q", j.Kind)
 		label = "unknown" // kind is caller input: keep the metric's label set fixed
 	} else {
-		err = h(ctx, j.Payload)
+		err = h(ctx, db, j)
 	}
-	// Its own deadline: a handler that timed out must still get marked failed.
-	saveCtx, cancelSave := context.WithTimeout(context.Background(), completeTimeout)
+	cause := context.Cause(ctx)
+	abandon(nil) // stop the heartbeat before writing the outcome
+	<-watching
+
+	// Their own deadline: a handler that timed out must still get its outcome recorded.
+	saveCtx, cancelSave := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancelSave()
-	if cerr := complete(saveCtx, db, j.ID, workerID, err); cerr != nil {
-		slog.Error("complete failed", "job", j.ID, "err", cerr)
+	switch {
+	case errors.Is(cause, errLeaseLost):
+		slog.Warn("job abandoned", "job", j.ID, "err", cause)
+		return
+	case errors.Is(cause, errShutdown):
+		if rerr := release(saveCtx, db, j, workerID); rerr != nil {
+			slog.Error("release failed", "job", j.ID, "err", rerr) // the reaper gets it when the lease runs out
+		}
+		slog.Warn("job released", "job", j.ID)
+		return
+	}
+	held, cerr := complete(saveCtx, db, j, workerID, err)
+	if cerr != nil {
+		slog.Error("complete failed", "job", j.ID, "err", cerr) // the lease runs out and the job runs again
+		return
+	}
+	if !held {
+		slog.Warn("job finished after its lease was lost; outcome dropped", "job", j.ID)
 		return
 	}
 	status := "succeeded"
 	if err != nil {
 		status = "failed"
-		slog.Warn("job failed", "job", j.ID, "kind", j.Kind, "err", err)
+		slog.Warn("job failed", "job", j.ID, "kind", j.Kind, "attempt", j.Attempts, "err", err)
 	}
 	jobsDone.WithLabelValues(label, status).Inc()
+}
+
+// reapLoop runs the reaper every reapInterval until ctx is cancelled.
+// ponytail: every scheduler replica reaps; that's safe (SKIP LOCKED). Phase 3 adds a leader for cron.
+func reapLoop(ctx context.Context, db *pgxpool.Pool) {
+	slog.Info("reaper started")
+	for {
+		rctx, cancel := context.WithTimeout(ctx, dbTimeout)
+		requeued, dead, err := reap(rctx, db)
+		cancel()
+		if err != nil && ctx.Err() == nil {
+			slog.Error("reap failed", "err", err)
+		} else if requeued+dead > 0 {
+			slog.Warn("reaped expired leases", "requeued", requeued, "dead", dead)
+		}
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(reapInterval):
+		}
+	}
 }
 
 func splitQueues(s string) []string {

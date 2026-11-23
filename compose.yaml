@@ -56,7 +56,7 @@ services:
       DATABASE_URL: *db-url
       WORKER_QUEUES: default
     init: true
-    stop_grace_period: 35s # a last claim + handler + complete can take 33 s, see worker.go
+    stop_grace_period: 35s # a last claim (5 s) + drain (25 s) + release (4 s), see worker.go
     healthcheck:
       test: ["CMD", "/app/api", "healthcheck"]
       interval: 5s
@@ -73,6 +73,32 @@ services:
       migrate:
         condition: service_completed_successfully
     mem_limit: 128m
+    restart: unless-stopped
+
+  # Same image, run as `api scheduler`: the lease reaper today, cron from phase 3.
+  scheduler:
+    build: ./apps/api
+    command: ["scheduler"]
+    environment:
+      DATABASE_URL: *db-url
+    init: true
+    stop_grace_period: 15s
+    healthcheck:
+      test: ["CMD", "/app/api", "healthcheck"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    develop:
+      watch:
+        - action: rebuild
+          path: ./apps/api
+    depends_on:
+      db:
+        condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
+    mem_limit: 64m
     restart: unless-stopped
 
   db:
