@@ -221,10 +221,11 @@ COMPOSE_FILE=compose.yaml sh common/scripts/scale.sh
 4 replicas served 1.1× the requests of 1. One Go process already spreads across every core, and the run shares 8 CPUs with Caddy, Postgres and k6, so on one machine extra api replicas buy redundancy, not throughput. Replica counts matter for `worker`, which phase 7 measures.
 
 **Chaos test.** `infra/chaos-test.sh 4` inserts 10,000 `effect` jobs (each sleeps 10 ms after its side effect)
-for 4 workers, then 8 times waits 2–6 s, SIGKILLs every worker and restarts them 0–2 s later. On the M1 laptop,
-again shared with other stacks: all 10,000 succeeded in 211 s, `effects` had exactly 10,000 rows, nothing was
-left `running`, and 18 jobs ran twice, all 18 requeued by the reaper after their lease expired. CI runs it on
-every PR.
+for 4 workers, then 8 times waits 2–6 s, SIGKILLs every worker and restarts them 0–2 s later. In
+[one CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/45093265380) at commit `b52ac04`: all 10,000
+succeeded in 86 s, `effects` had exactly 10,000 rows, nothing was left `running`, and 27 jobs ran twice, all 27
+requeued by the reaper after their lease expired. On the shared M1 laptop the same test took 211 s, with 18 jobs
+run twice. CI runs it on every PR and fails on any duplicate or lost job.
 
 ### How each part scales
 
