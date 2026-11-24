@@ -6,12 +6,13 @@ set -eu
 workers=${1:-5}
 dc="docker compose -f compose.yaml"
 base=${BASE_URL:-http://localhost:${HTTP_PORT:-8080}}
+token=${ADMIN_TOKEN:-$(sed -n 's/^ADMIN_TOKEN=//p' .env)}
 run="limits-$$-$(date +%s)"
 sql() {
   # shellcheck disable=SC2016 # the variables expand inside the container
   $dc exec -T db sh -c 'psql -U "$POSTGRES_USER" -d "$POSTGRES_DB" -v ON_ERROR_STOP=1 -tAc "$1"' sh "$1"
 }
-limits() { curl -fsS -o /dev/null -X PUT -H 'Content-Type: application/json' -d "$1" "$base/api/queues/default/limits"; }
+limits() { curl -fsS -u "admin:$token" -o /dev/null -X PUT -H 'Content-Type: application/json' -d "$1" "$base/api/admin/queues/default/limits"; }
 wait_done() {
   for _ in $(seq 1 120); do
     [ "$(sql "SELECT count(*) FROM jobs WHERE payload->>'run' = '$1' AND status <> 'succeeded'")" -eq 0 ] && return
@@ -19,7 +20,7 @@ wait_done() {
   done
   echo "FAIL: $1 jobs didn't finish" >&2; exit 1
 }
-trap 'curl -fsS -o /dev/null -X DELETE "$base/api/queues/default/limits" || true' EXIT
+trap 'curl -fsS -u "admin:$token" -o /dev/null -X DELETE "$base/api/admin/queues/default/limits" || true' EXIT
 
 $dc up -d --wait --build --scale worker="$workers"
 

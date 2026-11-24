@@ -6,7 +6,6 @@ import (
 	"os"
 	"testing"
 	"time"
-
 )
 
 func TestCronKeepsWallClockAcrossDST(t *testing.T) {

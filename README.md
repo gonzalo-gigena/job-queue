@@ -4,10 +4,11 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 5 of 8, concurrency and rate limits. Jobs run with leases, retries with backoff, a
-> dead-letter state and graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as
-> DAGs with compensation; queues can have concurrency and rate limits. The dashboard isn't built yet.
-> The API, including the dead-letter actions, has no authentication yet: don't expose it publicly.
+> **Status:** phase 6 of 8, dashboard. Jobs run with leases, retries with backoff, a dead-letter state and
+> graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as DAGs with compensation;
+> queues have concurrency and rate limits; a live dashboard shows and controls it all.
+> The dashboard and `/api/admin/*` need `ADMIN_TOKEN`. The app-facing endpoints (enqueue, job status, start a
+> run) have no authentication: keep them on a private network.
 
 ## Run it
 
@@ -18,7 +19,7 @@ cp .env.example .env
 docker compose up --watch
 ```
 
-Open http://localhost:8080. Needs only Docker with Compose v2. Code changes reload
+Open http://localhost:8080 for the dashboard (any user name, password `ADMIN_TOKEN` from `.env`). Needs only Docker with Compose v2. Code changes reload
 automatically (Compose Watch). On Windows, clone inside the WSL filesystem, not `/mnt/c`.
 
 Cloned without `--recurse-submodules`? Run `git submodule update --init`.
@@ -45,13 +46,29 @@ curl localhost:8080/api/jobs/1
 
 A worker runs one job at a time, for up to 5 minutes. Add workers with `--scale worker=N`.
 
+### Dashboard
+
+http://localhost:8080 shows each queue (ready, scheduled, running, dead, done per minute, failure rate over
+5 minutes, age of the oldest ready job, limits) with pause/resume, and the newest 50 jobs filtered by status,
+queue and kind, with retry and discard for dead jobs and cancel for queued or running ones. Click an id for
+the payload and last error. The *+20 jobs* and *+5 failing* buttons enqueue demo work.
+
+Live updates are Server-Sent Events from `GET /api/admin/stream`: each open dashboard makes the api query
+Postgres once a second. That's fine for a few viewers; past that, poll once per replica and fan out.
+
+Everything under `/api/admin/` takes HTTP basic auth with `ADMIN_TOKEN` as the password, or
+`Authorization: Bearer $ADMIN_TOKEN`. Basic auth means the browser prompts once and attaches it to every
+`fetch` and `EventSource`, with no login page or session to build. Cancelling a running job needs no message to
+its worker: the worker's next heartbeat (within 10 s) matches 0 rows, since the fence requires `running`, and it
+abandons the job.
+
 ### Cron schedules
 
 ```bash
-curl -X PUT localhost:8080/api/schedules/nightly-report \
+curl -u admin:$ADMIN_TOKEN -X PUT localhost:8080/api/admin/schedules/nightly-report \
   -d '{"cron":"0 3 * * *","timezone":"Europe/Madrid","kind":"sleep","payload":{"ms":100}}'
-curl localhost:8080/api/schedules
-curl -X DELETE localhost:8080/api/schedules/nightly-report
+curl -u admin:$ADMIN_TOKEN localhost:8080/api/admin/schedules
+curl -u admin:$ADMIN_TOKEN -X DELETE localhost:8080/api/admin/schedules/nightly-report
 ```
 
 `cron` is the standard 5 fields, an optional leading seconds field (`*/10 * * * * *`), or `@daily`-style
@@ -67,8 +84,8 @@ nor duplicates a run.
 ### Queue limits
 
 ```bash
-curl -X PUT localhost:8080/api/queues/emails/limits -d '{"max_running":5,"rate_per_sec":10,"burst":20}'
-curl -X DELETE localhost:8080/api/queues/emails/limits   # unlimited again
+curl -u admin:$ADMIN_TOKEN -X PUT localhost:8080/api/admin/queues/emails/limits -d '{"max_running":5,"rate_per_sec":10,"burst":20}'
+curl -u admin:$ADMIN_TOKEN -X DELETE localhost:8080/api/admin/queues/emails/limits   # unlimited again
 ```
 
 `max_running` caps how many of the queue's jobs run at once across every worker; `rate_per_sec` caps how many
@@ -117,8 +134,8 @@ Delivery is **at-least-once**: a job can run more than once, so handlers must be
   the job, and its result is dropped.
 - **Deploy (SIGTERM):** the worker stops claiming, gives the in-flight job up to 25 s to finish, then cancels it
   and hands it back to `queued` without using up an attempt.
-- **Dead jobs:** `POST /api/jobs/{id}/retry` requeues one with fresh attempts; `POST /api/jobs/{id}/discard`
-  marks it `cancelled`. The phase 6 dashboard calls these.
+- **Dead jobs:** `POST /api/admin/jobs/{id}/retry` requeues one with fresh attempts; `POST /api/admin/jobs/{id}/discard`
+  marks it `cancelled`. The dashboard has buttons for both.
 
 The idempotent pattern, as the `effect` kind does it: record the job in `processed` in the same transaction
 as the side effect, and skip the side effect if it is already there.
@@ -225,6 +242,8 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Lease length | 30 s lease, 10 s heartbeat, reaper every 5 s | A short lease without heartbeats | A heartbeat lets a job run longer than its lease, and two missed beats are tolerated. Cost: a crashed worker's job waits 30–35 s before it runs again. |
 | Retries | Exponential backoff with full jitter, `min(1 h, 1 s·2^attempt)·rand()`, then `dead` | A fixed delay | Jitter stops failed jobs from retrying in lockstep against a struggling dependency. A crash uses an attempt too, so a job that kills its worker ends in `dead`. |
 | Shutdown | Stop claiming, 25 s to finish, then cancel and release the job, giving the attempt back | Waiting for the job, or dropping it | Inside compose's 35 s grace period, so the job is handed back rather than left for the reaper. A deploy doesn't push a job toward `dead`. |
+| Live dashboard | Server-Sent Events, each stream polling Postgres every 1 s | WebSockets, `LISTEN` per viewer | One-way updates are all it needs, `EventSource` reconnects by itself, and Caddy passes the stream through. Cost: one overview query per viewer per second. |
+| Admin auth | HTTP basic auth (password `ADMIN_TOKEN`) or a bearer token on `/api/admin/*`, constant-time compare | No auth, or a login page with sessions | An open admin panel can cancel and retry anyone's jobs. Basic auth is native in the browser, so no login page. Cost: one shared secret, no per-user audit. |
 | Reaper | One `UPDATE … SKIP LOCKED` on a partial index of running jobs, on every scheduler replica | Only the leader reaps | Concurrent reapers each take different rows, so it needs no leader. The index only holds running jobs, so it stays tiny however large `jobs` grows. |
 | Scheduler leader | `pg_try_advisory_lock` on a direct connection, standbys retry every 1 s | etcd or Raft, or one scheduler | If the leader dies, its connection closes and the lock frees: the CI drill SIGKILLs the leader container and the standby leads 1 s later. Each run's idempotency key (`schedule_id:time`) and `FOR UPDATE SKIP LOCKED` on the schedule row make a brief two-leader overlap harmless. Cost: a leader cut off by a network partition (not killed) holds the lock until TCP notices. |
 | Missed cron runs | Enqueue every missed run on takeover, 100 per schedule per tick | Skip to the next future run | The failover test demands no skipped run. Cost: after a long outage a minutely schedule fires a burst of catch-up jobs; disable it first if that's wrong for the job. |
