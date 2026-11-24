@@ -177,6 +177,7 @@ func lead(ctx context.Context, db *pgxpool.Pool, directURL string) error {
 	slog.Info("became scheduler leader")
 	isLeader.Set(1)
 	defer isLeader.Set(0)
+	var archived time.Time
 	for {
 		// Still holding the session (and so the lock)? Stop leading as soon as we can't tell.
 		pctx, cancel := context.WithTimeout(ctx, dbTimeout)
@@ -192,6 +193,12 @@ func lead(ctx context.Context, db *pgxpool.Pool, directURL string) error {
 			slog.Error("cron tick failed", "err", err)
 		} else if n > 0 {
 			slog.Info("cron enqueued", "jobs", n)
+		}
+		if time.Since(archived) > time.Minute {
+			archived = time.Now()
+			actx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			archiveOnce(actx, db) // ponytail: blocks cron for its duration; fine at 5,000 rows per statement
+			cancel()
 		}
 		select {
 		case <-ctx.Done():

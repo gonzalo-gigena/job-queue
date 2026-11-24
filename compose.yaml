@@ -4,6 +4,9 @@ include:
   - path: common/observability/compose.yaml
     env_file: .env
 x-db-url: &db-url postgres://${POSTGRES_USER:?copy .env.example to .env}:${POSTGRES_PASSWORD:?copy .env.example to .env}@db:5432/${POSTGRES_DB:?copy .env.example to .env}?sslmode=disable
+# Pools go through PgBouncer (transaction mode). Session state (LISTEN, the scheduler's advisory lock)
+# can't, so those use DIRECT_DATABASE_URL.
+x-pooled-url: &pooled-url postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@pgbouncer:5432/${POSTGRES_DB}?sslmode=disable
 
 services:
   caddy:
@@ -27,7 +30,8 @@ services:
   api:
     build: ./apps/api
     environment:
-      DATABASE_URL: *db-url
+      DATABASE_URL: *pooled-url
+      DIRECT_DATABASE_URL: *db-url
       ADMIN_TOKEN: ${ADMIN_TOKEN:?copy .env.example to .env}
     init: true
     stop_grace_period: 15s
@@ -42,7 +46,7 @@ services:
         - action: rebuild
           path: ./apps/api
     depends_on:
-      db:
+      pgbouncer:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -54,7 +58,8 @@ services:
     build: ./apps/api
     command: ["worker"]
     environment:
-      DATABASE_URL: *db-url
+      DATABASE_URL: *pooled-url
+      DIRECT_DATABASE_URL: *db-url
       WORKER_QUEUES: default
     init: true
     stop_grace_period: 35s # a last claim (5 s) + drain (25 s) + release (4 s), see worker.go
@@ -69,7 +74,7 @@ services:
         - action: rebuild
           path: ./apps/api
     depends_on:
-      db:
+      pgbouncer:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -83,7 +88,8 @@ services:
     command: ["scheduler"]
     scale: 2
     environment:
-      DATABASE_URL: *db-url
+      DATABASE_URL: *pooled-url
+      DIRECT_DATABASE_URL: *db-url
     init: true
     stop_grace_period: 15s
     healthcheck:
@@ -97,7 +103,7 @@ services:
         - action: rebuild
           path: ./apps/api
     depends_on:
-      db:
+      pgbouncer:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
@@ -118,6 +124,31 @@ services:
       timeout: 3s
       retries: 10
     mem_limit: 512m
+    restart: unless-stopped
+
+  # Transaction pooling: many worker connections share a few server connections. 1.21+ tracks
+  # protocol-level prepared statements, so pgx's statement cache works through it.
+  pgbouncer:
+    image: edoburu/pgbouncer:v1.24.1-p1
+    environment:
+      DB_HOST: db
+      DB_USER: ${POSTGRES_USER}
+      DB_PASSWORD: ${POSTGRES_PASSWORD}
+      DB_NAME: ${POSTGRES_DB}
+      POOL_MODE: transaction
+      AUTH_TYPE: scram-sha-256
+      MAX_PREPARED_STATEMENTS: 200
+      DEFAULT_POOL_SIZE: 20
+      MAX_CLIENT_CONN: 2000
+    healthcheck:
+      test: ["CMD", "pg_isready", "-h", "127.0.0.1", "-p", "5432"]
+      interval: 3s
+      timeout: 3s
+      retries: 10
+    depends_on:
+      db:
+        condition: service_healthy
+    mem_limit: 64m
     restart: unless-stopped
 
   migrate:

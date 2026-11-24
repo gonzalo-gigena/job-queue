@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"strings"
 	"time"
 
@@ -76,6 +77,7 @@ var (
 )
 
 const (
+	notifyJitter = 20 * time.Millisecond
 	pollInterval = time.Second // fallback: a run_at came due, or a NOTIFY was missed
 	reapInterval = 5 * time.Second
 	// claimTimeout + drainTimeout + dbTimeout stay inside compose's 35 s stop_grace_period.
@@ -141,6 +143,11 @@ func work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, que
 			select {
 			case <-ctx.Done():
 			case <-wake:
+				// Every idle worker hears the same NOTIFY: spread their claims so they don't all
+				// hit the dequeue query in the same instant, where all but one find nothing.
+				// 0–20 ms, not PLAN.md's 0–50: at 50 one idle worker's p95 enqueue → handled
+				// is ~48 ms, at the edge of the 50 ms target.
+				time.Sleep(rand.N(notifyJitter))
 			case <-time.After(idle):
 			case <-listening:
 				if ctx.Err() == nil {

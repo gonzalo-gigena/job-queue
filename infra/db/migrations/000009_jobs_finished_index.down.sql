@@ -1,0 +1,1 @@
+DROP INDEX CONCURRENTLY jobs_finished;
