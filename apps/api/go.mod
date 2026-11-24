@@ -1,4 +1,4 @@
-module api
+module github.com/gonzalo-gigena/job-queue/apps/api
 
 go 1.27
 

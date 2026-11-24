@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -32,7 +32,7 @@ func TestArchiveMovesFinishedJobsAndDropsOldPartitions(t *testing.T) {
 		t.Fatalf("%d hot, %d archived; want the old succeeded one archived, recent, dead and queued kept", hot, archived)
 	}
 	// Its idempotency key is free again.
-	if _, created, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 1, IdempotencyKey: &key}); err != nil || !created {
+	if _, created, err := Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 1, IdempotencyKey: &key}); err != nil || !created {
 		t.Fatal("re-enqueue after archive:", created, err)
 	}
 

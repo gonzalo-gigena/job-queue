@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -14,9 +14,9 @@ import (
 
 // Queue names double as the NOTIFY channel suffix, so keep them to safe identifiers.
 // The jobs table has the same CHECK.
-var queueName = regexp.MustCompile(`^[a-z0-9_]{1,50}$`)
+var QueueName = regexp.MustCompile(`^[a-z0-9_]{1,50}$`)
 
-type newJob struct {
+type Job struct {
 	Queue          string          `json:"queue"`
 	Kind           string          `json:"kind"`
 	Payload        json.RawMessage `json:"payload"`
@@ -26,19 +26,19 @@ type newJob struct {
 	IdempotencyKey *string         `json:"idempotency_key"`
 }
 
-type job struct {
+type Delivery struct {
 	ID       int64
 	Kind     string
 	Payload  json.RawMessage
 	Attempts int
 }
 
-func (j *newJob) validate() error {
+func (j *Job) validate() error {
 	if j.Queue == "" {
 		j.Queue = "default"
 	}
-	if !queueName.MatchString(j.Queue) {
-		return errors.New("queue must match " + queueName.String())
+	if !QueueName.MatchString(j.Queue) {
+		return errors.New("queue must match " + QueueName.String())
 	}
 	if j.Kind == "" {
 		return errors.New("kind is required")
@@ -62,20 +62,29 @@ func (j *newJob) validate() error {
 	return nil
 }
 
-// enqueue inserts a job and NOTIFYs jobs_<queue> in the same transaction, so listeners
-// hear it only once the row is committed. Enqueueing a (queue, idempotency_key) that
-// already exists is a no-op that returns the existing id.
-func enqueue(ctx context.Context, db *pgxpool.Pool, j newJob) (id int64, created bool, err error) {
+// Enqueue validates and inserts a job (filling in defaults), and NOTIFYs jobs_<queue> in the
+// same transaction, so listeners hear it only once the row is committed. Enqueueing a
+// (queue, idempotency_key) that already exists is a no-op that returns the existing id.
+func Enqueue(ctx context.Context, db *pgxpool.Pool, j Job) (id int64, created bool, err error) {
 	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
-		id, created, err = enqueueTx(ctx, tx, j)
+		id, created, err = EnqueueTx(ctx, tx, j)
 		return err
 	})
 	return id, created, err
 }
 
-// enqueueTx is enqueue inside the caller's transaction: the job exists exactly when the
-// caller's own writes commit.
-func enqueueTx(ctx context.Context, tx pgx.Tx, j newJob) (id int64, created bool, err error) {
+// EnqueueTx is Enqueue inside the caller's transaction: the job exists exactly when the
+// caller's own writes commit, and not at all if they roll back.
+func EnqueueTx(ctx context.Context, tx pgx.Tx, j Job) (id int64, created bool, err error) {
+	if err := j.validate(); err != nil {
+		return 0, false, err
+	}
+	return enqueueTx(ctx, tx, j)
+}
+
+// enqueueTx inserts without validating: the API validates first, and workflow steps use the
+// reserved wf: kinds.
+func enqueueTx(ctx context.Context, tx pgx.Tx, j Job) (id int64, created bool, err error) {
 	err = tx.QueryRow(ctx, `
 		INSERT INTO jobs (queue, kind, payload, priority, run_at, max_attempts, idempotency_key)
 		VALUES ($1, $2, $3, $4, coalesce($5, now()), $6, $7)
@@ -95,7 +104,7 @@ func enqueueTx(ctx context.Context, tx pgx.Tx, j newJob) (id int64, created bool
 
 // dequeue claims up to limit due jobs, trying queues in the order given. When a rate limit
 // held jobs back, retryIn says when the next token is due (0 otherwise).
-func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []string, limit int) (out []job, retryIn time.Duration, err error) {
+func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []string, limit int) (out []Delivery, retryIn time.Duration, err error) {
 	for _, q := range queues {
 		if len(out) >= limit {
 			break
@@ -128,7 +137,7 @@ func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []st
 // same count. Counting in the locking statement isn't either: under READ COMMITTED a
 // statement's snapshot is taken before it waits for the lock, so it would miss the claims
 // the previous lock holder just committed.
-func claim(ctx context.Context, db *pgxpool.Pool, workerID, queue string, limit int) (jobs []job, retryIn time.Duration, err error) {
+func claim(ctx context.Context, db *pgxpool.Pool, workerID, queue string, limit int) (jobs []Delivery, retryIn time.Duration, err error) {
 	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		var maxRunning *int32
 		var rate, tokens *float64
@@ -169,7 +178,7 @@ func claim(ctx context.Context, db *pgxpool.Pool, workerID, queue string, limit 
 		if err != nil {
 			return err
 		}
-		if jobs, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (j job, err error) {
+		if jobs, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (j Delivery, err error) {
 			err = r.Scan(&j.ID, &j.Kind, &j.Payload, &j.Attempts)
 			return j, err
 		}); err != nil || !limited || rate == nil {
@@ -248,7 +257,7 @@ const fence = `id = $1 AND worker_id = $2 AND attempts = $3 AND status = 'runnin
 // when the lease was lost, in which case the outcome is dropped: the job runs again.
 // after, if set, runs in the same transaction with the job's new status, so a workflow
 // step's result and the steps it unblocks commit together with the job.
-func complete(ctx context.Context, db *pgxpool.Pool, j job, workerID string, jobErr error, after func(ctx context.Context, tx pgx.Tx, status string) error) (held bool, err error) {
+func complete(ctx context.Context, db *pgxpool.Pool, j Delivery, workerID string, jobErr error, after func(ctx context.Context, tx pgx.Tx, status string) error) (held bool, err error) {
 	var lastErr *string
 	if jobErr != nil {
 		msg := jobErr.Error()
@@ -279,7 +288,7 @@ func complete(ctx context.Context, db *pgxpool.Pool, j job, workerID string, job
 }
 
 // heartbeat extends the lease. false means the job was taken away: abandon it.
-func heartbeat(ctx context.Context, db *pgxpool.Pool, j job, workerID string) (bool, error) {
+func heartbeat(ctx context.Context, db *pgxpool.Pool, j Delivery, workerID string) (bool, error) {
 	tag, err := db.Exec(ctx, `UPDATE jobs SET lease_until = now() + $4 * interval '1 ms' WHERE `+fence,
 		j.ID, workerID, j.Attempts, leaseDuration.Milliseconds())
 	return tag.RowsAffected() == 1, err
@@ -287,7 +296,7 @@ func heartbeat(ctx context.Context, db *pgxpool.Pool, j job, workerID string) (b
 
 // release hands a job back on graceful shutdown. The attempt is given back too: a deploy
 // isn't the job's fault, and shouldn't push it toward dead.
-func release(ctx context.Context, db *pgxpool.Pool, j job, workerID string) error {
+func release(ctx context.Context, db *pgxpool.Pool, j Delivery, workerID string) error {
 	_, err := db.Exec(ctx, `
 		UPDATE jobs SET status = 'queued', attempts = attempts - 1, run_at = now(), lease_until = NULL
 		WHERE `+fence, j.ID, workerID, j.Attempts)

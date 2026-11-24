@@ -1,4 +1,4 @@
-package main
+package qq
 
 // Integration tests against real Postgres with the migrations applied.
 // Run: docker compose -f compose.yaml run --rm test (skipped without DATABASE_URL).
@@ -43,7 +43,7 @@ func TestEnqueueIsIdempotent(t *testing.T) {
 	for i := range ids {
 		wg.Go(func() {
 			var err error
-			ids[i], created[i], err = enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5, IdempotencyKey: &key})
+			ids[i], created[i], err = Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5, IdempotencyKey: &key})
 			if err != nil {
 				t.Error(err)
 			}
@@ -71,7 +71,7 @@ func TestEnqueueIsIdempotent(t *testing.T) {
 
 	// No key means no deduplication.
 	for range 2 {
-		if _, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5}); err != nil {
+		if _, _, err := Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5}); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -156,13 +156,13 @@ func TestDequeueOrderAndRunAt(t *testing.T) {
 	db, q := testDB(t)
 	ctx := context.Background()
 	later := time.Now().Add(time.Hour)
-	for _, j := range []newJob{
+	for _, j := range []Job{
 		{Kind: "low", Priority: 0},
 		{Kind: "high", Priority: 10},
 		{Kind: "future", Priority: 100, RunAt: &later},
 	} {
 		j.Queue, j.Payload, j.MaxAttempts = q, []byte("{}"), 5
-		if _, _, err := enqueue(ctx, db, j); err != nil {
+		if _, _, err := Enqueue(ctx, db, j); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -262,7 +262,7 @@ func TestDequeueReadsIndexInOrder(t *testing.T) {
 
 func TestValidate(t *testing.T) {
 	long, empty := strings.Repeat("k", 256), ""
-	for name, j := range map[string]newJob{
+	for name, j := range map[string]Job{
 		"no kind":          {},
 		"bad queue":        {Kind: "noop", Queue: `x"; DROP`},
 		"negative attempt": {Kind: "noop", MaxAttempts: -1},
@@ -273,7 +273,7 @@ func TestValidate(t *testing.T) {
 			t.Errorf("%s: accepted", name)
 		}
 	}
-	ok := newJob{Kind: "noop"}
+	ok := Job{Kind: "noop"}
 	if err := ok.validate(); err != nil || ok.Queue != "default" || ok.MaxAttempts != 5 || string(ok.Payload) != "{}" {
 		t.Errorf("defaults: %+v, %v", ok, err)
 	}
@@ -290,7 +290,7 @@ func TestEnqueueNotifiesAfterCommit(t *testing.T) {
 	if _, err := conn.Exec(ctx, "LISTEN jobs_"+q); err != nil {
 		t.Fatal(err)
 	}
-	if _, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5}); err != nil {
+	if _, _, err := Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5}); err != nil {
 		t.Fatal(err)
 	}
 	wait, cancel := context.WithTimeout(ctx, 2*time.Second)
@@ -308,11 +308,11 @@ func TestWorkerHandlesJob(t *testing.T) {
 	db, q := testDB(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error)
-	go func() { done <- work(ctx, db, os.Getenv("DATABASE_URL"), "w1", []string{q}) }()
+	go func() { done <- Work(ctx, db, os.Getenv("DATABASE_URL"), "w1", []string{q}) }()
 	defer func() { cancel(); <-done }()
 
 	time.Sleep(200 * time.Millisecond) // let it LISTEN and go idle
-	id, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5})
+	id, _, err := Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -353,7 +353,7 @@ func TestBackoff(t *testing.T) {
 }
 
 // claimOne claims the queue's next job, failing the test if there is none.
-func claimOne(t *testing.T, db *pgxpool.Pool, worker, q string) job {
+func claimOne(t *testing.T, db *pgxpool.Pool, worker, q string) Delivery {
 	t.Helper()
 	jobs, _, err := dequeue(context.Background(), db, worker, []string{q}, 1)
 	if err != nil || len(jobs) != 1 {
@@ -375,7 +375,7 @@ func jobState(t *testing.T, db *pgxpool.Pool, id int64) (status string, attempts
 func TestRetriesThenDeadLetter(t *testing.T) {
 	db, q := testDB(t)
 	ctx := context.Background()
-	id, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 2})
+	id, _, err := Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -420,7 +420,7 @@ func TestRetriesThenDeadLetter(t *testing.T) {
 func TestReaperAndFencing(t *testing.T) {
 	db, q := testDB(t)
 	ctx := context.Background()
-	id, _, err := enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 2})
+	id, _, err := Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 2})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -468,7 +468,7 @@ func TestHeartbeatAbandonsLostJob(t *testing.T) {
 	ctx := context.Background()
 	defer func(d time.Duration) { heartbeatInterval = d }(heartbeatInterval)
 	heartbeatInterval = 50 * time.Millisecond
-	id, _, _ := enqueue(ctx, db, newJob{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":10000}`), MaxAttempts: 5})
+	id, _, _ := Enqueue(ctx, db, Job{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":10000}`), MaxAttempts: 5})
 	j := claimOne(t, db, "w", q)
 
 	done := make(chan struct{})
@@ -478,7 +478,7 @@ func TestHeartbeatAbandonsLostJob(t *testing.T) {
 	select {
 	case <-done:
 	case <-time.After(2 * time.Second):
-		t.Fatal("handler kept running after its lease was taken")
+		t.Fatal("Handler kept running after its lease was taken")
 	}
 	if status, _, _ := jobState(t, db, id); status != "queued" {
 		t.Fatalf("abandoned job: %s, want left queued", status)
@@ -490,8 +490,8 @@ func TestGracefulShutdown(t *testing.T) {
 	defer func(d time.Duration) { drainTimeout = d }(drainTimeout)
 	drainTimeout = 300 * time.Millisecond
 	bg := context.Background()
-	short, _, _ := enqueue(bg, db, newJob{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":100}`), MaxAttempts: 5})
-	long, _, _ := enqueue(bg, db, newJob{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":60000}`), MaxAttempts: 5})
+	short, _, _ := Enqueue(bg, db, Job{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":100}`), MaxAttempts: 5})
+	long, _, _ := Enqueue(bg, db, Job{Queue: q, Kind: "sleep", Payload: []byte(`{"ms":60000}`), MaxAttempts: 5})
 
 	for _, tc := range []struct {
 		id       int64
@@ -522,8 +522,8 @@ func TestGracefulShutdown(t *testing.T) {
 func TestEffectRunsOnce(t *testing.T) {
 	db, q := testDB(t)
 	ctx := context.Background()
-	id, _, _ := enqueue(ctx, db, newJob{Queue: q, Kind: "effect", Payload: []byte("{}"), MaxAttempts: 5})
-	j := job{ID: id, Kind: "effect", Payload: []byte("{}")}
+	id, _, _ := Enqueue(ctx, db, Job{Queue: q, Kind: "effect", Payload: []byte("{}"), MaxAttempts: 5})
+	j := Delivery{ID: id, Kind: "effect", Payload: []byte("{}")}
 	for range 3 { // at-least-once: the same job delivered three times
 		if err := handlers["effect"](ctx, db, j); err != nil {
 			t.Fatal(err)

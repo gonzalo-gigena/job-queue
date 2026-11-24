@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -19,7 +19,7 @@ import (
 // requireAdmin guards /api/admin/*: HTTP basic auth with ADMIN_TOKEN as the password (any
 // user name), or "Authorization: Bearer <ADMIN_TOKEN>". Basic auth lets the browser prompt
 // once and send it with every fetch and EventSource, with no login page to build.
-func requireAdmin(token string, next http.Handler) http.Handler {
+func RequireAdmin(token string, next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if token == "" {
 			http.Error(w, `{"error":"set ADMIN_TOKEN to use the admin API"}`, http.StatusServiceUnavailable)
@@ -160,7 +160,7 @@ func pauseQueue(ctx context.Context, db *pgxpool.Pool, queue string, paused bool
 }
 
 // adminRoutes registers the dashboard's API. Every route here is behind requireAdmin.
-func adminRoutes(route func(string, handler), mux *http.ServeMux, token string, db *pgxpool.Pool, shutdown context.Context) {
+func AdminRoutes(route func(string, Handler), mux *http.ServeMux, token string, db *pgxpool.Pool, shutdown context.Context) {
 	idOf := func(r *http.Request) (int64, error) { return strconv.ParseInt(r.PathValue("id"), 10, 64) }
 	fail := func(what string, err error) (int, any) {
 		slog.Error(what+" failed", "err", err)
@@ -224,8 +224,8 @@ func adminRoutes(route func(string, handler), mux *http.ServeMux, token string, 
 	for action, paused := range map[string]bool{"pause": true, "resume": false} {
 		route("POST /api/admin/queues/{queue}/"+action, func(r *http.Request) (int, any) {
 			q := r.PathValue("queue")
-			if !queueName.MatchString(q) {
-				return 400, map[string]string{"error": "queue must match " + queueName.String()}
+			if !QueueName.MatchString(q) {
+				return 400, map[string]string{"error": "queue must match " + QueueName.String()}
 			}
 			if err := pauseQueue(r.Context(), db, q, paused); err != nil {
 				return fail(action, err)
@@ -239,8 +239,8 @@ func adminRoutes(route func(string, handler), mux *http.ServeMux, token string, 
 			return 400, map[string]string{"error": err.Error()}
 		}
 		q := r.PathValue("queue")
-		if !queueName.MatchString(q) {
-			return 400, map[string]string{"error": "queue must match " + queueName.String()}
+		if !QueueName.MatchString(q) {
+			return 400, map[string]string{"error": "queue must match " + QueueName.String()}
 		}
 		if err := l.validate(); err != nil {
 			return 400, map[string]string{"error": err.Error()}
@@ -292,7 +292,7 @@ func adminRoutes(route func(string, handler), mux *http.ServeMux, token string, 
 	// Live updates: every second, the queue overview and the newest jobs matching the
 	// filters in the query string. ponytail: each viewer polls Postgres once a second; fan out
 	// one poll per replica if there are ever more than a handful of viewers.
-	mux.Handle("GET /api/admin/stream", requireAdmin(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	mux.Handle("GET /api/admin/stream", RequireAdmin(token, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		flusher, ok := w.(http.Flusher)
 		if !ok {
 			http.Error(w, "streaming unsupported", 500)

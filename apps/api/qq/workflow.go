@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -17,44 +17,44 @@ import (
 // succeeds, the step's output and the jobs for the steps it unblocks commit in the same
 // transaction as the job's completion, under a lock on the run's row.
 //
-//	newWorkflow("signup").
+//	NewWorkflow("signup").
 //		step("create", create).
 //		step("email", email, "create").
 //		step("crm", crm, "create").
 //		onFailure("cleanup", cleanup)
 
-type stepInput struct {
+type StepInput struct {
 	RunID   int64
 	Input   json.RawMessage
 	Parents map[string]json.RawMessage // outputs of the step's dependencies (on_failure steps: of every succeeded step)
 }
 
-type stepFunc func(ctx context.Context, db *pgxpool.Pool, in stepInput) (output any, err error)
+type StepFunc func(ctx context.Context, db *pgxpool.Pool, in StepInput) (output any, err error)
 
 type stepDef struct {
 	deps      []string
 	onFailure bool
-	fn        stepFunc
+	fn        StepFunc
 }
 
-type workflow struct {
+type Workflow struct {
 	name, queue string
 	maxAttempts int32    // per step job
 	order       []string // definition order, so runs list their steps predictably
 	steps       map[string]stepDef
 }
 
-var workflows = map[string]*workflow{}
+var workflows = map[string]*Workflow{}
 
-func newWorkflow(name string) *workflow {
-	w := &workflow{name: name, queue: "default", maxAttempts: 5, steps: map[string]stepDef{}}
+func NewWorkflow(name string) *Workflow {
+	w := &Workflow{name: name, queue: "default", maxAttempts: 5, steps: map[string]stepDef{}}
 	workflows[name] = w
 	return w
 }
 
-// step adds a step that runs once every step in deps has succeeded. A dependency must be
+// Step adds a step that runs once every step in deps has succeeded. A dependency must be
 // defined first, which also rules out cycles.
-func (w *workflow) step(name string, fn stepFunc, deps ...string) *workflow {
+func (w *Workflow) Step(name string, fn StepFunc, deps ...string) *Workflow {
 	for _, d := range deps {
 		if s, ok := w.steps[d]; !ok || s.onFailure {
 			panic(fmt.Sprintf("workflow %s: step %s depends on undefined step %s", w.name, name, d))
@@ -63,12 +63,12 @@ func (w *workflow) step(name string, fn stepFunc, deps ...string) *workflow {
 	return w.add(name, stepDef{deps: deps, fn: fn})
 }
 
-// onFailure adds a compensation step: it runs only if some step fails for good.
-func (w *workflow) onFailure(name string, fn stepFunc) *workflow {
+// OnFailure adds a compensation step: it runs only if some step fails for good.
+func (w *Workflow) OnFailure(name string, fn StepFunc) *Workflow {
 	return w.add(name, stepDef{onFailure: true, fn: fn})
 }
 
-func (w *workflow) add(name string, s stepDef) *workflow {
+func (w *Workflow) add(name string, s stepDef) *Workflow {
 	if _, dup := w.steps[name]; dup || strings.ContainsAny(name, ".:") {
 		panic(fmt.Sprintf("workflow %s: bad or duplicate step name %q", w.name, name))
 	}
@@ -85,10 +85,10 @@ type stepRef struct {
 }
 
 // enqueueStep inserts a step's job, keyed so a step can never be enqueued twice for one run.
-func enqueueStep(ctx context.Context, tx pgx.Tx, w *workflow, runID int64, step string) error {
+func enqueueStep(ctx context.Context, tx pgx.Tx, w *Workflow, runID int64, step string) error {
 	payload, _ := json.Marshal(stepRef{runID, step})
 	key := fmt.Sprintf("wf:%d:%s", runID, step)
-	id, _, err := enqueueTx(ctx, tx, newJob{Queue: w.queue, Kind: "wf:" + w.name + "." + step, Payload: payload, MaxAttempts: w.maxAttempts, IdempotencyKey: &key})
+	id, _, err := enqueueTx(ctx, tx, Job{Queue: w.queue, Kind: "wf:" + w.name + "." + step, Payload: payload, MaxAttempts: w.maxAttempts, IdempotencyKey: &key})
 	if err != nil {
 		return err
 	}
@@ -96,8 +96,8 @@ func enqueueStep(ctx context.Context, tx pgx.Tx, w *workflow, runID int64, step 
 	return err
 }
 
-// startRun creates a run and its steps and enqueues the steps with no dependencies.
-func startRun(ctx context.Context, db *pgxpool.Pool, name string, input json.RawMessage) (runID int64, err error) {
+// StartRun creates a run and its steps and enqueues the steps with no dependencies.
+func StartRun(ctx context.Context, db *pgxpool.Pool, name string, input json.RawMessage) (runID int64, err error) {
 	w, ok := workflows[name]
 	if !ok {
 		return 0, fmt.Errorf("no workflow %q", name)
@@ -129,12 +129,12 @@ func startRun(ctx context.Context, db *pgxpool.Pool, name string, input json.Raw
 }
 
 // runStep executes a step's job and returns the completion hook that records its outcome.
-func runStep(ctx context.Context, db *pgxpool.Pool, j job) (func(context.Context, pgx.Tx, string) error, error) {
+func runStep(ctx context.Context, db *pgxpool.Pool, j Delivery) (func(context.Context, pgx.Tx, string) error, error) {
 	var ref stepRef
 	if err := json.Unmarshal(j.Payload, &ref); err != nil {
 		return nil, err
 	}
-	in := stepInput{RunID: ref.RunID, Parents: map[string]json.RawMessage{}}
+	in := StepInput{RunID: ref.RunID, Parents: map[string]json.RawMessage{}}
 	var name string
 	if err := db.QueryRow(ctx, `SELECT workflow, input FROM workflow_runs WHERE id = $1`, ref.RunID).Scan(&name, &in.Input); err != nil {
 		return nil, err
@@ -184,7 +184,7 @@ func lockRun(ctx context.Context, tx pgx.Tx, runID int64) (status string, err er
 	return status, err
 }
 
-func stepSucceeded(ctx context.Context, tx pgx.Tx, w *workflow, ref stepRef, output []byte) error {
+func stepSucceeded(ctx context.Context, tx pgx.Tx, w *Workflow, ref stepRef, output []byte) error {
 	runStatus, err := lockRun(ctx, tx, ref.RunID)
 	if err != nil {
 		return err
@@ -221,7 +221,7 @@ func stepSucceeded(ctx context.Context, tx pgx.Tx, w *workflow, ref stepRef, out
 
 // stepFailed fails the run once a step's job is dead: steps that haven't started are skipped
 // and the on_failure steps are enqueued (the saga pattern). Steps already running finish.
-func stepFailed(ctx context.Context, tx pgx.Tx, w *workflow, ref stepRef, msg string) error {
+func stepFailed(ctx context.Context, tx pgx.Tx, w *Workflow, ref stepRef, msg string) error {
 	runStatus, err := lockRun(ctx, tx, ref.RunID)
 	if err != nil {
 		return err
@@ -261,7 +261,7 @@ func stepDied(ctx context.Context, tx pgx.Tx, payload []byte, msg string) error 
 	}
 	w, ok := workflows[name]
 	if !ok {
-		w = &workflow{name: name} // the scheduler may not know this workflow: fail the run, skip compensation
+		w = &Workflow{name: name} // the scheduler may not know this workflow: fail the run, skip compensation
 	}
 	return stepFailed(ctx, tx, w, ref, msg)
 }
@@ -316,8 +316,8 @@ func init() {
 		MS   int
 		Fail string
 	}
-	step := func(name string, f func(in, map[string]json.RawMessage) (any, error)) stepFunc {
-		return func(ctx context.Context, _ *pgxpool.Pool, s stepInput) (any, error) {
+	step := func(name string, f func(in, map[string]json.RawMessage) (any, error)) StepFunc {
+		return func(ctx context.Context, _ *pgxpool.Pool, s StepInput) (any, error) {
 			var a in
 			if err := json.Unmarshal(s.Input, &a); err != nil {
 				return nil, err
@@ -337,15 +337,15 @@ func init() {
 		return o.N
 	}
 	plusOne := func(_ in, p map[string]json.RawMessage) (any, error) { return map[string]int{"n": n(p["a"]) + 1}, nil }
-	newWorkflow("demo").
-		step("a", step("a", func(a in, _ map[string]json.RawMessage) (any, error) { return map[string]int{"n": a.N}, nil })).
-		step("b", step("b", plusOne), "a").
-		step("c", step("c", plusOne), "a").
-		step("d", step("d", plusOne), "a").
-		step("e", step("e", func(_ in, p map[string]json.RawMessage) (any, error) {
+	NewWorkflow("demo").
+		Step("a", step("a", func(a in, _ map[string]json.RawMessage) (any, error) { return map[string]int{"n": a.N}, nil })).
+		Step("b", step("b", plusOne), "a").
+		Step("c", step("c", plusOne), "a").
+		Step("d", step("d", plusOne), "a").
+		Step("e", step("e", func(_ in, p map[string]json.RawMessage) (any, error) {
 			return map[string]int{"n": n(p["b"]) + n(p["c"]) + n(p["d"])}, nil
 		}), "b", "c", "d").
-		onFailure("undo", step("undo", func(_ in, p map[string]json.RawMessage) (any, error) {
+		OnFailure("undo", step("undo", func(_ in, p map[string]json.RawMessage) (any, error) {
 			done := []string{}
 			for s := range p {
 				done = append(done, s)

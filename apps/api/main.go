@@ -1,8 +1,8 @@
 // One binary, several roles:
 //
-//	api              stateless HTTP service: enqueue and query jobs
+//	api              stateless HTTP service: enqueue and query jobs, the admin API and dashboard stream
 //	api worker       claims and runs jobs (WORKER_QUEUES, default "default")
-//	api scheduler    requeues jobs whose lease expired; the leader replica runs cron
+//	api scheduler    requeues jobs whose lease expired; the leader replica runs cron and archiving
 //	api healthcheck  lets the distroless image check itself
 package main
 
@@ -22,8 +22,8 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/gonzalo-gigena/job-queue/apps/api/qq"
 	"github.com/jackc/pgx/v5"
-	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
@@ -34,8 +34,6 @@ var (
 	requests  = promauto.NewCounterVec(prometheus.CounterOpts{Name: "http_requests_total", Help: "HTTP requests."}, []string{"route", "status"})
 	durations = promauto.NewHistogramVec(prometheus.HistogramOpts{Name: "http_request_duration_seconds", Help: "HTTP request latency.", Buckets: prometheus.DefBuckets}, []string{"route"})
 )
-
-type handler func(*http.Request) (int, any)
 
 func main() {
 	if len(os.Args) > 1 && os.Args[1] == "healthcheck" {
@@ -98,7 +96,7 @@ func run(role string) error {
 	errc := make(chan error, 2)
 	workDone := make(chan struct{})
 	mux := http.NewServeMux()
-	route := func(pattern string, h handler) { mux.Handle(pattern, instrument(pattern, replica, h)) }
+	route := func(pattern string, h qq.Handler) { mux.Handle(pattern, instrument(pattern, replica, h)) }
 
 	route("GET /healthz", func(*http.Request) (int, any) { return 200, map[string]bool{"ok": true} })
 	route("GET /readyz", func(r *http.Request) (int, any) {
@@ -116,123 +114,36 @@ func run(role string) error {
 		directURL := envOr("DIRECT_DATABASE_URL", dbURL)
 		go func() {
 			defer close(workDone)
-			go reapLoop(ctx, pool)
-			leadLoop(ctx, pool, directURL)
+			go qq.ReapLoop(ctx, pool)
+			qq.LeadLoop(ctx, pool, directURL)
 		}()
 	case "worker":
-		queues := splitQueues(envOr("WORKER_QUEUES", "default"))
+		queues := qq.SplitQueues(envOr("WORKER_QUEUES", "default"))
 		if len(queues) == 0 {
 			return errors.New("WORKER_QUEUES lists no queue")
 		}
 		for _, q := range queues {
-			if !queueName.MatchString(q) {
-				return fmt.Errorf("WORKER_QUEUES: %q must match %s", q, queueName)
+			if !qq.QueueName.MatchString(q) {
+				return fmt.Errorf("WORKER_QUEUES: %q must match %s", q, qq.QueueName)
 			}
 		}
-		// LISTEN must bypass any pooler; today DATABASE_URL is already direct.
+		// LISTEN is session state: it must bypass PgBouncer.
 		listenURL := envOr("DIRECT_DATABASE_URL", dbURL)
 		go func() {
 			defer close(workDone)
-			if err := work(ctx, pool, listenURL, replica, queues); err != nil && ctx.Err() == nil {
+			if err := qq.Work(ctx, pool, listenURL, replica, queues); err != nil && ctx.Err() == nil {
 				errc <- err
 			}
 		}()
 	default:
 		close(workDone)
-		route("POST /api/jobs", func(r *http.Request) (int, any) {
-			var j newJob
-			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&j); err != nil {
-				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
-			}
-			if err := j.validate(); err != nil {
-				return 400, map[string]string{"error": err.Error()}
-			}
-			id, created, err := enqueue(r.Context(), pool, j)
-			var pgErr *pgconn.PgError
-			if errors.As(err, &pgErr) && strings.HasPrefix(pgErr.Code, "22") {
-				// data exception, e.g. a NUL character in a string or an out-of-range run_at
-				return 400, map[string]string{"error": "a field has a value Postgres can't store"}
-			}
-			if err != nil {
-				slog.Error("enqueue failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			if !created {
-				return 200, map[string]any{"id": id, "duplicate": true}
-			}
-			return 201, map[string]any{"id": id}
-		})
-		route("POST /api/workflows/{name}/runs", func(r *http.Request) (int, any) {
-			var body struct {
-				Input json.RawMessage `json:"input"`
-			}
-			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&body); err != nil {
-				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
-			}
-			if _, ok := workflows[r.PathValue("name")]; !ok {
-				return 404, map[string]string{"error": "no such workflow"}
-			}
-			id, err := startRun(r.Context(), pool, r.PathValue("name"), body.Input)
-			if err != nil {
-				slog.Error("start run failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 201, map[string]any{"id": id}
-		})
-		route("GET /api/workflows/runs/{id}", func(r *http.Request) (int, any) {
-			id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-			if err != nil {
-				return 400, map[string]string{"error": "id must be a number"}
-			}
-			run, err := getRun(r.Context(), pool, id)
-			if errors.Is(err, errNoRun) {
-				return 404, map[string]string{"error": "not found"}
-			}
-			if err != nil {
-				slog.Error("get run failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 200, run
-		})
+		qq.Routes(route, pool)
 		// The dashboard and every admin action: behind ADMIN_TOKEN.
 		token := os.Getenv("ADMIN_TOKEN")
-		adminRoute := func(pattern string, h handler) {
-			mux.Handle(pattern, requireAdmin(token, instrument(pattern, replica, h)))
+		adminRoute := func(pattern string, h qq.Handler) {
+			mux.Handle(pattern, qq.RequireAdmin(token, instrument(pattern, replica, h)))
 		}
-		adminRoutes(adminRoute, mux, token, pool, ctx)
-		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
-			var out struct {
-				ID         int64      `json:"id"`
-				Queue      string     `json:"queue"`
-				Kind       string     `json:"kind"`
-				Status     string     `json:"status"`
-				Attempts   int        `json:"attempts"`
-				WorkerID   *string    `json:"worker_id"`
-				LastError  *string    `json:"last_error"`
-				RunAt      time.Time  `json:"run_at"`
-				CreatedAt  time.Time  `json:"created_at"`
-				FinishedAt *time.Time `json:"finished_at"`
-			}
-			id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-			if err != nil {
-				return 400, map[string]string{"error": "id must be a number"}
-			}
-			err = pool.QueryRow(r.Context(), `SELECT id, queue, kind, status, attempts, worker_id, last_error, run_at, created_at, finished_at
-				FROM jobs WHERE id = $1`, id).
-				Scan(&out.ID, &out.Queue, &out.Kind, &out.Status, &out.Attempts, &out.WorkerID, &out.LastError, &out.RunAt, &out.CreatedAt, &out.FinishedAt)
-			if errors.Is(err, pgx.ErrNoRows) {
-				return 404, map[string]string{"error": "not found"}
-			}
-			if err != nil {
-				slog.Error("get job failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 200, out
-		})
+		qq.AdminRoutes(adminRoute, mux, token, pool, ctx)
 	}
 	route("GET /api/hello", func(r *http.Request) (int, any) {
 		var msg *string
@@ -267,7 +178,7 @@ func run(role string) error {
 }
 
 // instrument adds replica/request-id headers, JSON encoding, metrics and a request log line.
-func instrument(pattern, replica string, h handler) http.Handler {
+func instrument(pattern, replica string, h qq.Handler) http.Handler {
 	label := pattern
 	if pattern == "/" {
 		label = "unmatched" // fixed label set, no cardinality blow-up

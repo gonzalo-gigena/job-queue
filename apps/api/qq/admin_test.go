@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -27,7 +27,7 @@ func TestRequireAdmin(t *testing.T) {
 			r.Header.Set("Authorization", "Bearer "+c.bearer)
 		}
 		w := httptest.NewRecorder()
-		requireAdmin(c.token, ok).ServeHTTP(w, r)
+		RequireAdmin(c.token, ok).ServeHTTP(w, r)
 		if w.Code != c.want {
 			t.Errorf("%s: %d, want %d", name, w.Code, c.want)
 		}
@@ -40,7 +40,7 @@ func TestRequireAdmin(t *testing.T) {
 func TestCancelRunningJobFencesItsWorker(t *testing.T) {
 	db, q := testDB(t)
 	ctx := context.Background()
-	enqueue(ctx, db, newJob{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5})
+	Enqueue(ctx, db, Job{Queue: q, Kind: "noop", Payload: []byte("{}"), MaxAttempts: 5})
 	jobs, _, err := dequeue(ctx, db, "w", []string{q}, 1)
 	if err != nil || len(jobs) != 1 {
 		t.Fatal(jobs, err)

@@ -161,6 +161,25 @@ services:
         condition: service_healthy
     restart: "no"
 
+  # The demo producer: realistic traffic through the TypeScript client only.
+  # docker compose --profile demo up -d example-app
+  example-app:
+    image: node:24.22-alpine
+    profiles: [demo]
+    working_dir: /apps/example
+    volumes:
+      - ./apps/example:/apps/example:ro
+      - ./apps/client-ts:/apps/client-ts:ro
+    command: ["node", "main.ts"]
+    environment:
+      BASE_URL: http://caddy:8080
+    init: true
+    depends_on:
+      caddy:
+        condition: service_started
+    mem_limit: 64m
+    restart: unless-stopped
+
   # docker compose run --rm seed
   seed:
     image: postgres:18.6-alpine

@@ -15,10 +15,14 @@ jobs:
       - run: cp .env.example .env
       - name: Migrations follow the lock rules
         run: sh common/scripts/check-migrations.sh
+      - name: TypeScript client tests
+        run: docker run --rm -v "$PWD/apps":/apps:ro node:24.22-alpine node --test /apps/client-ts/client.test.ts
       - name: Tests against real Postgres (claims, retries, leases, fencing, graceful shutdown)
         run: docker compose -f compose.yaml run --rm test
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
+      - name: "Example app: enqueues through the TypeScript client only, and its jobs run"
+        run: sh infra/example-smoke.sh
       - name: Stack with 3 workers, each takes jobs
         run: |
           docker compose -f compose.yaml up -d --wait --build --scale worker=3
