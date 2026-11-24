@@ -4,9 +4,11 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 7 of 8, scale and retention. Jobs run with leases, retries with backoff, a dead-letter state and
-> graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as DAGs with compensation;
-> queues have concurrency and rate limits; a live dashboard shows and controls it all.
+> **Status:** all 8 phases of [PLAN.md](PLAN.md) are built. Jobs run with leases, retries with backoff, a
+> dead-letter state and graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as
+> DAGs with compensation; queues have concurrency and rate limits; finished jobs are archived; a live dashboard
+> shows and controls it all; Go and TypeScript SDKs enqueue, and the Go one runs handlers. The
+> "Beyond the plan" extensions (durable waits, versioning, fairness, debounce, tracing) aren't built.
 > The dashboard and `/api/admin/*` need `ADMIN_TOKEN`. The app-facing endpoints (enqueue, job status, start a
 > run) have no authentication: keep them on a private network.
 
@@ -120,6 +122,46 @@ goes `dead` (by error or by crashing its worker), the run fails, steps that hadn
 the `onFailure` steps run with every succeeded step's output, so they know what to undo. Steps already running
 finish. A dead step's job can't be retried on its own, since its run has already compensated.
 
+### SDKs
+
+**Go:** `github.com/gonzalo-gigena/job-queue/apps/api/qq` is the engine itself, so a Go service can enqueue in
+its own transaction and run its own handlers (the plan called this `qq/client`; a separate wrapper package
+would only re-export it):
+
+```go
+// Enqueue in the same transaction as the write the job is about: both commit, or neither.
+err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+	if _, err := tx.Exec(ctx, `INSERT INTO users (id, email) VALUES ($1, $2)`, id, email); err != nil {
+		return err
+	}
+	_, _, err := qq.EnqueueTx(ctx, tx, qq.Job{Kind: "welcome_email", Payload: payload, IdempotencyKey: &key})
+	return err
+})
+
+// Run jobs: register handlers, then work. LISTEN needs a direct (non-PgBouncer) URL.
+qq.Handle("welcome_email", func(ctx context.Context, db *pgxpool.Pool, d qq.Delivery) error { … })
+err = qq.Work(ctx, db, directURL, hostname, []string{"default"})
+```
+
+`qq.Enqueue` (own transaction), `qq.NewWorkflow(…).Step(…)` and `qq.StartRun` are there too. `qq/sdk_test.go`
+uses only the exported API.
+
+**TypeScript:** `apps/client-ts/client.ts`, no dependencies, plain TypeScript that Node 24 runs directly:
+
+```ts
+import { createClient } from './client.ts';
+const qq = createClient('http://localhost:8080');
+const { id, duplicate } = await qq.enqueue({ kind: 'welcome_email', payload: { user: 42 }, idempotency_key: 'welcome:42' });
+const run = await qq.startRun('demo', { n: 1 });
+console.log((await qq.job(id)).status, (await qq.run(run.id)).status);
+```
+
+Errors throw `QueueError` with the HTTP status. Retrying an `enqueue` is safe when it has an `idempotency_key`.
+
+**Example app:** `apps/example/main.ts` produces realistic traffic (deduplicated welcome emails, `demo` workflow
+runs with the occasional failing step, background jobs, jobs that end up dead) using only the TypeScript
+client. `docker compose --profile demo up -d example-app`, then watch the dashboard.
+
 ### When things fail
 
 Delivery is **at-least-once**: a job can run more than once, so handlers must be idempotent.
@@ -167,6 +209,7 @@ id as the provider's idempotency key instead.
 | Limits across 5 workers | `sh infra/limits-test.sh 5` |
 | Chaos test: kill workers mid-run | `sh infra/chaos-test.sh 4` (10,000 jobs, about 1–4 minutes) |
 | Lint migrations | `sh common/scripts/check-migrations.sh` |
+| Demo traffic for the dashboard | `docker compose --profile demo up -d example-app` |
 | Throughput at 1, 2, 4, 8 workers | `sh infra/throughput.sh` |
 | Measure enqueue → handled | `docker compose --profile loadtest run --rm k6 run /scripts/latency.js` |
 | Prove scaling works | `sh common/scripts/smoke.sh 3` |
@@ -183,7 +226,7 @@ id as the provider's idempotency key instead.
 ```mermaid
 flowchart LR
   browser["Browser<br/>dashboard"]
-  app["Your app<br/>Go / TypeScript SDK"]
+  app["Your app / example-app<br/>Go or TypeScript SDK"]
   subgraph stack["docker compose"]
     caddy["Caddy :8080"]
     api["api ×N<br/>enqueue, admin, live updates"]
@@ -197,17 +240,15 @@ flowchart LR
   api --> db
   worker -->|"claim: FOR UPDATE SKIP LOCKED<br/>wake: LISTEN/NOTIFY"| db
   sched -->|"requeue expired leases<br/>cron: advisory-lock leader"| db
-  class app planned
-  classDef planned stroke-dasharray: 5 5
+  app -.->|"Go SDK: EnqueueTx in your transaction"| db
 ```
-
-Solid boxes and arrows run today. Dashed ones are planned in [PLAN.md](PLAN.md).
 
 Postgres is the only stateful service. Workers claim jobs with `FOR UPDATE SKIP LOCKED`, so any number of them pull from one table without waiting on each other.
 
 ## Stack
 
-- **api:** Go 1.27 (`net/http` + `pgx` + Prometheus client), distroless runtime image. Stateless, so it scales with `--scale api=N`.
+- **api:** Go 1.27 (`net/http` + `pgx` + Prometheus client), distroless runtime image. `main.go` is process
+  plumbing; the engine, HTTP routes and SDK are package `apps/api/qq`. Stateless, so it scales with `--scale api=N`.
 - **worker:** the same binary run as `api worker`. Its pool goes through PgBouncer (`DATABASE_URL`); `LISTEN` uses
   one direct connection (`DIRECT_DATABASE_URL`). After a NOTIFY wake-up it waits 0–20 ms at random, so idle
   workers don't all hit the dequeue query in the same instant.
@@ -268,10 +309,11 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Workflow steps | Ordinary jobs, kind `wf:<workflow>.<step>`, idempotency key `wf:<run>:<step>` | A separate step executor | Steps inherit leases, retries, fencing and the dead-letter state. The key means a step is enqueued at most once per run even if its parents' completion is replayed. The chaos drill SIGKILLs every worker 4 times during 300 runs: all succeed with exactly 1,500 step jobs. |
 | Workflow failure | The run fails, pending steps are skipped, `onFailure` steps run (saga) | Distributed transactions | Steps call external systems, which can't join a transaction. Compensation steps get every succeeded step's output. Cost: compensations must be idempotent too. |
 | Packaging | One Go binary with `api`, `worker` and `scheduler` subcommands | A separate image per role | One Dockerfile, one image, and the same version everywhere. |
+| Go SDK | The engine package `qq` itself is the SDK | A separate `qq/client` wrapper, or HTTP only | Enqueueing inside the caller's transaction needs SQL, and defining handlers needs the worker loop, so a client has to be the engine. A wrapper would only re-export it. Cost: the SDK's surface is whatever `qq` exports. |
+| TypeScript SDK | One dependency-free file over HTTP, erasable TypeScript | A generated OpenAPI client, an npm package | Five endpoints don't need a generator. Node 24 runs it with no build step; copy it or vendor it. |
 | Load balancing | Caddy `dynamic a` upstreams (the `lb` snippet in `common/`) | `reverse_proxy api:8080`, Traefik | Caddy re-reads Docker DNS every 5 s, so `--scale api=N` needs no config change and no Docker socket mount. A plain `reverse_proxy api:8080` is a single upstream to Caddy and doesn't reliably spread load. |
 | Migrations | A one-shot `migrate` service that finishes before the api starts | Each replica migrating on boot | Replicas starting together would race on the same migration. |
 
-Rows for parts that aren't built yet record the plan's choice. Each one gets confirmed or revised when that phase is built.
 
 ## Scaling
 
@@ -322,7 +364,7 @@ COMPOSE_FILE=compose.yaml sh common/scripts/scale.sh
 | 2 | 14,438 | 2.96 ms | 0.00% |
 | 4 | 14,468 | 3.06 ms | 0.00% |
 
-4 replicas served 1.1× the requests of 1. One Go process already spreads across every core, and the run shares 8 CPUs with Caddy, Postgres and k6, so on one machine extra api replicas buy redundancy, not throughput. Replica counts matter for `worker`, which phase 7 measures.
+4 replicas served 1.1× the requests of 1. One Go process already spreads across every core, and the run shares 8 CPUs with Caddy, Postgres and k6, so on one machine extra api replicas buy redundancy, not throughput. Replica counts matter for `worker`, measured below.
 
 **Chaos test.** `infra/chaos-test.sh 4` inserts 10,000 `effect` jobs (each sleeps 10 ms after its side effect)
 for 4 workers, then 8 times waits 2–6 s, SIGKILLs every worker and restarts them 0–2 s later. In

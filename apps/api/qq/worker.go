@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -20,20 +20,20 @@ var jobsDone = promauto.NewCounterVec(prometheus.CounterOpts{Name: "jobs_done_to
 
 // handlers maps a job kind to its code. Handlers must be idempotent: delivery is at-least-once.
 // They should return soon after ctx is cancelled (lease lost, shutdown deadline, timeout).
-var handlers = map[string]func(ctx context.Context, db *pgxpool.Pool, j job) error{
-	"noop": func(context.Context, *pgxpool.Pool, job) error { return nil },
-	"sleep": func(ctx context.Context, _ *pgxpool.Pool, j job) error {
+var handlers = map[string]HandlerFunc{
+	"noop": func(context.Context, *pgxpool.Pool, Delivery) error { return nil },
+	"sleep": func(ctx context.Context, _ *pgxpool.Pool, j Delivery) error {
 		var a struct{ MS int }
 		if err := json.Unmarshal(j.Payload, &a); err != nil {
 			return err
 		}
 		return sleep(ctx, time.Duration(a.MS)*time.Millisecond)
 	},
-	// effect is the idempotent-handler pattern: the side effect (a row in effects) and the
+	// effect is the idempotent-Handler pattern: the side effect (a row in effects) and the
 	// processed(job_id) marker commit together, so a second run finds the marker and skips.
 	// {"ms":…} sleeps after the commit, widening the window where a crash forces a re-run.
 	// {"fail":true} always errors, to exercise retries and the dead state.
-	"effect": func(ctx context.Context, db *pgxpool.Pool, j job) error {
+	"effect": func(ctx context.Context, db *pgxpool.Pool, j Delivery) error {
 		var a struct {
 			MS   int
 			Fail bool
@@ -90,7 +90,7 @@ const (
 // and polls every pollInterval in case a notification was missed or a run_at came due.
 // ponytail: one job at a time per process; scale with `--scale worker=N`.
 // In-process concurrency comes later if a replica turns out to be idle on I/O.
-func work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, queues []string) error {
+func Work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, queues []string) error {
 	// LISTEN is session state, so it needs its own direct connection, never a
 	// transaction-mode pooler (PgBouncer would hand the session to someone else).
 	conn, err := pgx.Connect(ctx, listenURL)
@@ -163,10 +163,10 @@ func work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, que
 	return nil
 }
 
-// runJob executes one job and records the outcome. While the handler runs, a heartbeat
+// runJob executes one job and records the outcome. While the Handler runs, a heartbeat
 // extends the lease and abandons the job if it was taken away. On shutdown the job gets
 // drainTimeout to finish, then it is cancelled and its lease released.
-func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) {
+func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j Delivery) {
 	ctx, cancel := context.WithTimeout(context.Background(), handlerTimeout)
 	defer cancel()
 	ctx, abandon := context.WithCancelCause(ctx)
@@ -208,7 +208,7 @@ func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) 
 	case isStep(j.Kind):
 		after, err = runStep(ctx, db, j) // kinds come from workflows defined in code: a bounded label set
 	case !ok:
-		err = fmt.Errorf("no handler for kind %q", j.Kind)
+		err = fmt.Errorf("no Handler for kind %q", j.Kind)
 		label = "unknown" // kind is caller input: keep the metric's label set fixed
 	default:
 		err = h(ctx, db, j)
@@ -217,7 +217,7 @@ func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) 
 	abandon(nil) // stop the heartbeat before writing the outcome
 	<-watching
 
-	// Their own deadline: a handler that timed out must still get its outcome recorded.
+	// Their own deadline: a Handler that timed out must still get its outcome recorded.
 	saveCtx, cancelSave := context.WithTimeout(context.Background(), dbTimeout)
 	defer cancelSave()
 	switch {
@@ -250,7 +250,7 @@ func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) 
 
 // reapLoop runs the reaper every reapInterval until ctx is cancelled.
 // Every scheduler replica reaps, not only the leader: that is safe (SKIP LOCKED) and needs no failover.
-func reapLoop(ctx context.Context, db *pgxpool.Pool) {
+func ReapLoop(ctx context.Context, db *pgxpool.Pool) {
 	slog.Info("reaper started")
 	for {
 		rctx, cancel := context.WithTimeout(ctx, dbTimeout)
@@ -269,7 +269,7 @@ func reapLoop(ctx context.Context, db *pgxpool.Pool) {
 	}
 }
 
-func splitQueues(s string) []string {
+func SplitQueues(s string) []string {
 	var qs []string
 	for _, q := range strings.Split(s, ",") {
 		if q = strings.TrimSpace(q); q != "" {
@@ -277,4 +277,16 @@ func splitQueues(s string) []string {
 		}
 	}
 	return qs
+}
+
+// HandlerFunc runs one delivery of a job. Delivery is at-least-once, so it must be
+// idempotent, and it should return soon after ctx is cancelled.
+type HandlerFunc func(ctx context.Context, db *pgxpool.Pool, d Delivery) error
+
+// Handle registers the code for a job kind. Call it before Work, e.g. from init.
+func Handle(kind string, fn HandlerFunc) {
+	if isStep(kind) {
+		panic(`kinds starting with "wf:" are reserved for workflow steps`)
+	}
+	handlers[kind] = fn
 }

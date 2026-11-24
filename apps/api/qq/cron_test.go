@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -76,7 +76,7 @@ func TestLeaderFailover(t *testing.T) {
 	defer cancel()
 	done := make(chan struct{}, 2)
 	for range 2 {
-		go func() { leadLoop(ctx, db, url); done <- struct{}{} }()
+		go func() { LeadLoop(ctx, db, url); done <- struct{}{} }()
 	}
 	defer func() { cancel(); <-done; <-done }()
 

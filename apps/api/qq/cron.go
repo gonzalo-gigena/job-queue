@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -60,7 +60,7 @@ func (s *schedule) validate() error {
 	if !scheduleID.MatchString(s.ID) {
 		return errors.New("id must match " + scheduleID.String())
 	}
-	j := newJob{Queue: s.Queue, Kind: s.Kind, Payload: s.Payload}
+	j := Job{Queue: s.Queue, Kind: s.Kind, Payload: s.Payload}
 	if err := j.validate(); err != nil {
 		return err
 	}
@@ -151,7 +151,7 @@ var leaderRetry = time.Second // how often a standby tries the lock: failover ta
 // leadLoop runs cron on whichever scheduler replica holds an advisory lock. The lock lives on
 // a direct session (never PgBouncer): if the leader dies, Postgres closes its session and the
 // lock frees, and a standby takes it on its next try.
-func leadLoop(ctx context.Context, db *pgxpool.Pool, directURL string) {
+func LeadLoop(ctx context.Context, db *pgxpool.Pool, directURL string) {
 	for ctx.Err() == nil {
 		if err := lead(ctx, db, directURL); err != nil && ctx.Err() == nil {
 			slog.Error("leader session ended", "err", err)
