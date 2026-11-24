@@ -4,9 +4,9 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 3 of 8, cron schedules. Jobs are enqueued, claimed and run with leases, retries with
-> backoff, a dead-letter state and graceful shutdown, and cron schedules run on a leader-elected scheduler.
-> Workflows and the dashboard aren't built yet.
+> **Status:** phase 4 of 8, workflows. Jobs run with leases, retries with backoff, a dead-letter state and
+> graceful shutdown; cron schedules run on a leader-elected scheduler; multi-step workflows run as DAGs with
+> compensation. Rate limits and the dashboard aren't built yet.
 > The API, including the dead-letter actions, has no authentication yet: don't expose it publicly.
 
 ## Run it
@@ -64,6 +64,33 @@ over within about a second. Each run is enqueued with the idempotency key `sched
 while no leader was up are enqueued on takeover (up to 100 per schedule per tick), so a failover neither skips
 nor duplicates a run.
 
+### Workflows
+
+A workflow is a DAG of steps defined in Go (`apps/api/workflow.go`). Each step is an ordinary job of kind
+`wf:<workflow>.<step>`, so it gets leases, retries and fencing, and reads its parents' outputs:
+
+```go
+newWorkflow("signup").
+	step("create", createUser).
+	step("email", sendWelcome, "create"). // runs once "create" succeeded
+	step("crm", addToCRM, "create").
+	step("done", markDone, "email", "crm"). // fan-in
+	onFailure("cleanup", deleteUser)       // compensation: only if some step fails for good
+```
+
+```bash
+curl -X POST localhost:8080/api/workflows/demo/runs -d '{"input":{"n":1}}'   # → {"id":…}
+curl localhost:8080/api/workflows/runs/1   # run status, and each step's status, output and job
+```
+
+The built-in `demo` workflow is `a → b, c, d → e` (input `{"n":…, "ms":…, "fail":"<step>"}`).
+
+When a step's job succeeds, its output, the run's state and the jobs for the steps it unblocks commit in the
+same transaction as the job's completion, holding the run's row lock (`SELECT … FOR UPDATE`). When a step's job
+goes `dead` (by error or by crashing its worker), the run fails, steps that hadn't started are `skipped`, and
+the `onFailure` steps run with every succeeded step's output, so they know what to undo. Steps already running
+finish. A dead step's job can't be retried on its own, since its run has already compensated.
+
 ### When things fail
 
 Delivery is **at-least-once**: a job can run more than once, so handlers must be idempotent.
@@ -107,6 +134,7 @@ id as the provider's idempotency key instead.
 | Scale the api | `docker compose up -d --scale api=3` |
 | Scale the workers | `docker compose up -d --scale worker=3`, check with `sh infra/worker-smoke.sh 3` |
 | Scheduler failover drill | `sh infra/scheduler-failover.sh` (SIGKILLs the leader) |
+| Workflow chaos: kill workers mid-DAG | `sh infra/workflow-chaos.sh 4` (300 runs of `demo`) |
 | Chaos test: kill workers mid-run | `sh infra/chaos-test.sh 4` (10,000 jobs, about 1–4 minutes) |
 | Lint migrations | `sh common/scripts/check-migrations.sh` |
 | Measure enqueue → handled | `docker compose --profile loadtest run --rm k6 run /scripts/latency.js` |
@@ -186,7 +214,9 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Scheduler leader | `pg_try_advisory_lock` on a direct connection, standbys retry every 1 s | etcd or Raft, or one scheduler | If the leader dies, its connection closes and the lock frees: the CI drill SIGKILLs the leader container and the standby leads 1 s later. Each run's idempotency key (`schedule_id:time`) and `FOR UPDATE SKIP LOCKED` on the schedule row make a brief two-leader overlap harmless. Cost: a leader cut off by a network partition (not killed) holds the lock until TCP notices. |
 | Missed cron runs | Enqueue every missed run on takeover, 100 per schedule per tick | Skip to the next future run | The failover test demands no skipped run. Cost: after a long outage a minutely schedule fires a burst of catch-up jobs; disable it first if that's wrong for the job. |
 | Cron library | `robfig/cron/v3` evaluated in the schedule's `time.Location` | Computing in UTC | Wall-clock schedules keep their local hour across DST (tested on New York's 2026 spring-forward). |
-| Workflow fan-in | Mark the step done and enqueue its children in one transaction, holding the run's row lock | Separate updates | Without the lock, two parents finishing at once each see the other still running, and the child never starts. |
+| Workflow fan-in | Complete the step's job, save its output and enqueue its children in one transaction, holding the run's row lock | Separate updates, or no lock | A crash can't land between "step done" and "children enqueued". Without the lock, two parents finishing at once each see the other still running and the child never starts: removing `FOR UPDATE` makes `TestWorkflowFanOutFanIn` hang every time. Cost: steps of one run complete one at a time. |
+| Workflow steps | Ordinary jobs, kind `wf:<workflow>.<step>`, idempotency key `wf:<run>:<step>` | A separate step executor | Steps inherit leases, retries, fencing and the dead-letter state. The key means a step is enqueued at most once per run even if its parents' completion is replayed. The chaos drill SIGKILLs every worker 4 times during 300 runs: all succeed with exactly 1,500 step jobs. |
+| Workflow failure | The run fails, pending steps are skipped, `onFailure` steps run (saga) | Distributed transactions | Steps call external systems, which can't join a transaction. Compensation steps get every succeeded step's output. Cost: compensations must be idempotent too. |
 | Packaging | One Go binary with `api`, `worker` and `scheduler` subcommands | A separate image per role | One Dockerfile, one image, and the same version everywhere. |
 | Load balancing | Caddy `dynamic a` upstreams (the `lb` snippet in `common/`) | `reverse_proxy api:8080`, Traefik | Caddy re-reads Docker DNS every 5 s, so `--scale api=N` needs no config change and no Docker socket mount. A plain `reverse_proxy api:8080` is a single upstream to Caddy and doesn't reliably spread load. |
 | Migrations | A one-shot `migrate` service that finishes before the api starts | Each replica migrating on boot | Replicas starting together would race on the same migration. |

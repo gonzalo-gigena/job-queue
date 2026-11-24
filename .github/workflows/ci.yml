@@ -27,6 +27,8 @@ jobs:
         run: docker compose -f compose.yaml --profile loadtest run --rm k6 run --quiet /scripts/latency.js
       - name: "Scheduler failover: SIGKILL the leader, standby takes over within 5 s, no run skipped or duplicated"
         run: sh infra/scheduler-failover.sh
+      - name: "Workflow chaos: 300 runs of a 5-step fan-out/fan-in DAG while workers are SIGKILLed"
+        run: sh infra/workflow-chaos.sh 4
       - name: "Chaos test: 10,000 jobs while every worker is SIGKILLed at random"
         run: sh infra/chaos-test.sh 4
       - name: Logs
