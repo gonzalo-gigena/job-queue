@@ -28,6 +28,7 @@ services:
     build: ./apps/api
     environment:
       DATABASE_URL: *db-url
+      ADMIN_TOKEN: ${ADMIN_TOKEN:?copy .env.example to .env}
     init: true
     stop_grace_period: 15s
     healthcheck:

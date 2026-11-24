@@ -164,60 +164,6 @@ func run(role string) error {
 			}
 			return 201, map[string]any{"id": id}
 		})
-		// Dead-letter actions for the dashboard. ponytail: unauthenticated like the rest of the API; phase 6 adds a token.
-		for action, fn := range map[string]func(context.Context, *pgxpool.Pool, int64) (bool, error){"retry": retryDead, "discard": discardDead} {
-			route("POST /api/jobs/{id}/"+action, func(r *http.Request) (int, any) {
-				id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
-				if err != nil {
-					return 400, map[string]string{"error": "id must be a number"}
-				}
-				ok, err := fn(r.Context(), pool, id)
-				if err != nil {
-					slog.Error(action+" failed", "err", err)
-					return 500, map[string]string{"error": "internal error"}
-				}
-				if !ok {
-					return 409, map[string]string{"error": "no dead job with that id"}
-				}
-				return 200, map[string]any{"id": id}
-			})
-		}
-		route("PUT /api/schedules/{id}", func(r *http.Request) (int, any) {
-			var s schedule
-			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&s); err != nil {
-				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
-			}
-			s.ID = r.PathValue("id")
-			if err := s.validate(); err != nil {
-				return 400, map[string]string{"error": err.Error()}
-			}
-			if err := putSchedule(r.Context(), pool, s); err != nil {
-				slog.Error("put schedule failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 200, s
-		})
-		route("GET /api/schedules", func(r *http.Request) (int, any) {
-			s, err := listSchedules(r.Context(), pool)
-			if err != nil {
-				slog.Error("list schedules failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 200, s
-		})
-		route("DELETE /api/schedules/{id}", func(r *http.Request) (int, any) {
-			tag, err := pool.Exec(r.Context(), `DELETE FROM schedules WHERE id = $1`, r.PathValue("id"))
-			if err != nil {
-				slog.Error("delete schedule failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			if tag.RowsAffected() == 0 {
-				return 404, map[string]string{"error": "not found"}
-			}
-			return 200, map[string]bool{"ok": true}
-		})
 		route("POST /api/workflows/{name}/runs", func(r *http.Request) (int, any) {
 			var body struct {
 				Input json.RawMessage `json:"input"`
@@ -252,33 +198,12 @@ func run(role string) error {
 			}
 			return 200, run
 		})
-		route("PUT /api/queues/{queue}/limits", func(r *http.Request) (int, any) {
-			var l queueLimits
-			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
-			dec.DisallowUnknownFields()
-			if err := dec.Decode(&l); err != nil {
-				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
-			}
-			q := r.PathValue("queue")
-			if !queueName.MatchString(q) {
-				return 400, map[string]string{"error": "queue must match " + queueName.String()}
-			}
-			if err := l.validate(); err != nil {
-				return 400, map[string]string{"error": err.Error()}
-			}
-			if err := setLimits(r.Context(), pool, q, l); err != nil {
-				slog.Error("set limits failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 200, l
-		})
-		route("DELETE /api/queues/{queue}/limits", func(r *http.Request) (int, any) {
-			if _, err := pool.Exec(r.Context(), `DELETE FROM queue_limits WHERE queue = $1`, r.PathValue("queue")); err != nil {
-				slog.Error("delete limits failed", "err", err)
-				return 500, map[string]string{"error": "internal error"}
-			}
-			return 200, map[string]bool{"ok": true}
-		})
+		// The dashboard and every admin action: behind ADMIN_TOKEN.
+		token := os.Getenv("ADMIN_TOKEN")
+		adminRoute := func(pattern string, h handler) {
+			mux.Handle(pattern, requireAdmin(token, instrument(pattern, replica, h)))
+		}
+		adminRoutes(adminRoute, mux, token, pool, ctx)
 		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
 			var out struct {
 				ID         int64      `json:"id"`
