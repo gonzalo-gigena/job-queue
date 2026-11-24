@@ -1,16 +1,22 @@
 # Job queue and workflow engine
 
-A Postgres-backed job queue with retries, cron schedules, multi-step workflows and a live dashboard.
+A Postgres-backed job queue and workflow engine: a small Sidekiq or Temporal with Postgres as the only
+stateful service.
 
-The step-by-step build plan is in [PLAN.md](PLAN.md).
+- **Jobs** with priorities, delayed runs, idempotency keys, leases and heartbeats, retries with backoff, a
+  dead-letter state and graceful shutdown. Delivery is at-least-once, and a chaos test proves no job is lost.
+- **Cron schedules** in any timezone, on a leader-elected scheduler that fails over in about a second.
+- **Workflows:** DAGs of steps defined in Go, with fan-out, fan-in and compensation steps (saga).
+- **Per-queue limits:** at most N running at once, at most N starts per second, across every worker.
+- **A live dashboard** with retry, cancel and pause, behind a token.
+- **Retention:** finished jobs move to a day-partitioned archive.
+- **SDKs:** Go (enqueue in your own transaction, run your own handlers) and TypeScript (over HTTP).
 
-> **Status:** all 8 phases of [PLAN.md](PLAN.md) are built. Jobs run with leases, retries with backoff, a
-> dead-letter state and graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as
-> DAGs with compensation; queues have concurrency and rate limits; finished jobs are archived; a live dashboard
-> shows and controls it all; Go and TypeScript SDKs enqueue, and the Go one runs handlers. The
-> "Beyond the plan" extensions (durable waits, versioning, fairness, debounce, tracing) aren't built.
-> The dashboard and `/api/admin/*` need `ADMIN_TOKEN`. The app-facing endpoints (enqueue, job status, start a
-> run) have no authentication: keep them on a private network.
+Built in eight phases from [PLAN.md](PLAN.md). Its "Beyond the plan" extensions (durable waits, workflow
+versioning, tenant fairness, debounce and batching, trace propagation) aren't built yet.
+
+> **Security:** the dashboard and `/api/admin/*` need `ADMIN_TOKEN`. The app-facing endpoints (enqueue, job
+> status, start or read a workflow run) have no authentication: keep them on a private network.
 
 ## Run it
 
@@ -21,8 +27,10 @@ cp .env.example .env
 docker compose up --watch
 ```
 
-Open http://localhost:8080 for the dashboard (any user name, password `ADMIN_TOKEN` from `.env`). Needs only Docker with Compose v2. Code changes reload
-automatically (Compose Watch). On Windows, clone inside the WSL filesystem, not `/mnt/c`.
+Open http://localhost:8080 for the dashboard (any user name, password `ADMIN_TOKEN` from `.env`), and run
+`docker compose --profile demo up -d example-app` for traffic to watch. Needs only Docker with Compose v2 and
+about 4 GB of RAM for it. Code changes reload automatically (Compose Watch). On Windows, clone inside the WSL
+filesystem, not `/mnt/c`.
 
 Cloned without `--recurse-submodules`? Run `git submodule update --init`.
 
@@ -47,6 +55,25 @@ curl localhost:8080/api/jobs/1
 | `idempotency_key` | none | 1 to 255 bytes, unique per queue |
 
 A worker runs one job at a time, for up to 5 minutes. Add workers with `--scale worker=N`.
+
+All endpoints, through Caddy on :8080:
+
+| Endpoint | Auth | What |
+|---|---|---|
+| `POST /api/jobs` | none | Enqueue a job |
+| `GET /api/jobs/{id}` | none | A job's status, attempts and last error |
+| `POST /api/workflows/{name}/runs` | none | Start a workflow run, body `{"input":…}` |
+| `GET /api/workflows/runs/{id}` | none | A run and its steps' status and output |
+| `GET /api/admin/queues` | admin | Per-queue depth, throughput, failure rate, oldest ready job, limits |
+| `GET /api/admin/jobs?status=&queue=&kind=&before_id=` | admin | The newest 50 matching jobs |
+| `GET /api/admin/jobs/{id}` | admin | A job with its payload, worker and key |
+| `POST /api/admin/jobs/{id}/retry`, `/discard`, `/cancel` | admin | Dead-letter actions; cancel a queued or running job |
+| `POST /api/admin/queues/{queue}/pause`, `/resume` | admin | Stop or restart claims from a queue |
+| `PUT`, `DELETE /api/admin/queues/{queue}/limits` | admin | Concurrency and rate limits |
+| `GET /api/admin/schedules`, `PUT`, `DELETE /api/admin/schedules/{id}` | admin | Cron schedules |
+| `GET /api/admin/stream?status=&queue=&kind=` | admin | Server-Sent Events: the overview and matching jobs every second |
+
+*admin* is HTTP basic auth with `ADMIN_TOKEN` as the password, or `Authorization: Bearer $ADMIN_TOKEN`.
 
 ### Dashboard
 
@@ -324,33 +351,20 @@ apart, so every worker is asleep in `LISTEN` when a job arrives. *Handled* is `f
 Postgres clock. *Round trip* is what a client sees through Caddy, from sending the POST to a polled GET that
 says `succeeded`.
 
-**On an idle system a job is handled 1 ms after enqueue at p50 and 2 ms at p95**, against a target of under
-50 ms. That's [one CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/44981277382) at commit `14b00b3`, with 3 workers on a GitHub-hosted `ubuntu-26.04` amd64
-runner that ran nothing else:
+**On an idle system a job is handled 8 ms after enqueue at p50 and 15 ms at p95**, against a target of under
+50 ms. That's the [CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/45297152948) for commit
+`70a32f1` (merged as `4a53b0b`), with 3 workers through PgBouncer on a GitHub-hosted `ubuntu-26.04` amd64 runner
+that ran nothing else:
 
 | | p50 | p95 | p99 | max |
 |---|---|---|---|---|
-| handled | 1 ms | 2 ms | 4 ms | 7 ms |
-| round trip | 4 ms | 5 ms | 9 ms | 10 ms |
+| handled | 8 ms | 15 ms | 17 ms | 18 ms |
+| round trip | 11 ms | 18 ms | 20 ms | 24 ms |
 
-The script compares whole milliseconds, so each value is ±1 ms.
-
-For comparison, under load on an Apple M1 laptop (8 CPUs, 8 GB for Docker). **This machine was not idle:** other projects' stacks shared
-the Docker VM, one of them using up to 4 cores, and the host's load average was 12–21. All eight runs:
-
-| workers | run | handled p50 | handled p95 | handled p99 | round trip p50 | round trip p95 |
-|---|---|---|---|---|---|---|
-| 1 | 1 | 3 ms | 22 ms | 54 ms | 8 ms | 40 ms |
-| 1 | 2 | 3 ms | 12 ms | 26 ms | 8 ms | 22 ms |
-| 1 | 3 | 10 ms | 59 ms | 121 ms | 23 ms | 127 ms |
-| 1 | 4 | 7 ms | 27 ms | 40 ms | 17 ms | 51 ms |
-| 3 | 1 | 8 ms | 24 ms | 33 ms | 16 ms | 47 ms |
-| 3 | 2 | 24 ms | 88 ms | 103 ms | 38 ms | 100 ms |
-| 3 | 3 | 12 ms | 75 ms | 110 ms | 23 ms | 91 ms |
-| 3 | 4 | 7 ms | 47 ms | 111 ms | 17 ms | 81 ms |
-
-The median stayed under 50 ms in every run. The p95 went over in three of the eight, so under heavy CPU
-contention the target doesn't hold at p95. CI runs the same script on every PR and fails above 50 ms at p95.
+The script compares whole milliseconds, so each value is ±1 ms. Before PgBouncer and the 0–20 ms wake-up jitter
+(phase 1, [run](https://github.com/gonzalo-gigena/job-queue/actions/runs/44981277382)) it was 1 ms at p50 and
+2 ms at p95. Most of the difference is the jitter, which is the price of not having every idle worker query at
+once; see *NOTIFY jitter* in Decisions. CI runs the same script on every PR and fails above 50 ms at p95.
 
 **HTTP, from the skeleton:** k6 with 20 virtual users for 20 s against `GET /api/hello`, which reads one row from Postgres through Caddy. Run on an Apple M1 laptop with 8 CPUs and 8 GB given to Docker, with the dev override left out:
 
@@ -366,12 +380,16 @@ COMPOSE_FILE=compose.yaml sh common/scripts/scale.sh
 
 4 replicas served 1.1× the requests of 1. One Go process already spreads across every core, and the run shares 8 CPUs with Caddy, Postgres and k6, so on one machine extra api replicas buy redundancy, not throughput. Replica counts matter for `worker`, measured below.
 
-**Chaos test.** `infra/chaos-test.sh 4` inserts 10,000 `effect` jobs (each sleeps 10 ms after its side effect)
-for 4 workers, then 8 times waits 2–6 s, SIGKILLs every worker and restarts them 0–2 s later. In
-[one CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/45093265380) at commit `b52ac04`: all 10,000
-succeeded in 86 s, `effects` had exactly 10,000 rows, nothing was left `running`, and 27 jobs ran twice, all 27
-requeued by the reaper after their lease expired. On the shared M1 laptop the same test took 211 s, with 18 jobs
-run twice. CI runs it on every PR and fails on any duplicate or lost job.
+**Failure drills, in CI on every PR.** From the same [CI run](https://github.com/gonzalo-gigena/job-queue/actions/runs/45297152948):
+
+| Drill | What it does | Result |
+|---|---|---|
+| `infra/chaos-test.sh 4` | 10,000 `effect` jobs on 4 workers; 8 times, waits 2–6 s, SIGKILLs every worker, restarts them 0–2 s later | All 10,000 succeeded in 86 s, exactly 10,000 effects, nothing left running; 28 jobs ran twice, all 28 requeued by the reaper |
+| `infra/workflow-chaos.sh 4` | 300 runs of the 5-step `demo` DAG while every worker is SIGKILLed 4 times | 300/300 succeeded in 51 s with the right fan-in result, exactly 1,500 step jobs, 11 re-run after their worker died |
+| `infra/scheduler-failover.sh` | SIGKILLs the scheduler leader under an every-second schedule | Standby leading within the same second; no run skipped or duplicated |
+| `infra/limits-test.sh 5` | 5 workers on a limited queue | Peak 2 running with `max_running` 2; at most 20 starts in any 1 s window with `rate_per_sec` 20 (19.1/s overall) |
+
+Each fails the build on any lost, duplicated or over-limit job.
 
 ### How each part scales
 
