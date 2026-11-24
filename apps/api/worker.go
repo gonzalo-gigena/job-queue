@@ -192,10 +192,14 @@ func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) 
 	label := j.Kind
 	h, ok := handlers[j.Kind]
 	var err error
-	if !ok {
+	var after func(context.Context, pgx.Tx, string) error
+	switch {
+	case isStep(j.Kind):
+		after, err = runStep(ctx, db, j) // kinds come from workflows defined in code: a bounded label set
+	case !ok:
 		err = fmt.Errorf("no handler for kind %q", j.Kind)
 		label = "unknown" // kind is caller input: keep the metric's label set fixed
-	} else {
+	default:
 		err = h(ctx, db, j)
 	}
 	cause := context.Cause(ctx)
@@ -216,7 +220,7 @@ func runJob(shutdown context.Context, db *pgxpool.Pool, workerID string, j job) 
 		slog.Warn("job released", "job", j.ID)
 		return
 	}
-	held, cerr := complete(saveCtx, db, j, workerID, err)
+	held, cerr := complete(saveCtx, db, j, workerID, err, after)
 	if cerr != nil {
 		slog.Error("complete failed", "job", j.ID, "err", cerr) // the lease runs out and the job runs again
 		return

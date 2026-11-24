@@ -43,6 +43,9 @@ func (j *newJob) validate() error {
 	if j.Kind == "" {
 		return errors.New("kind is required")
 	}
+	if isStep(j.Kind) {
+		return errors.New(`kinds starting with "wf:" are workflow steps; start a run instead`)
+	}
 	if len(j.Payload) == 0 {
 		j.Payload = json.RawMessage("{}")
 	}
@@ -64,24 +67,30 @@ func (j *newJob) validate() error {
 // already exists is a no-op that returns the existing id.
 func enqueue(ctx context.Context, db *pgxpool.Pool, j newJob) (id int64, created bool, err error) {
 	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
-		err := tx.QueryRow(ctx, `
-			INSERT INTO jobs (queue, kind, payload, priority, run_at, max_attempts, idempotency_key)
-			VALUES ($1, $2, $3, $4, coalesce($5, now()), $6, $7)
-			ON CONFLICT (queue, idempotency_key) DO NOTHING
-			RETURNING id`,
-			j.Queue, j.Kind, j.Payload, j.Priority, j.RunAt, j.MaxAttempts, j.IdempotencyKey).Scan(&id)
-		if errors.Is(err, pgx.ErrNoRows) { // conflict: hand back the job that already has this key
-			return tx.QueryRow(ctx, `SELECT id FROM jobs WHERE queue = $1 AND idempotency_key = $2`,
-				j.Queue, j.IdempotencyKey).Scan(&id)
-		}
-		if err != nil {
-			return err
-		}
-		created = true
-		_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, "jobs_"+j.Queue)
+		id, created, err = enqueueTx(ctx, tx, j)
 		return err
 	})
 	return id, created, err
+}
+
+// enqueueTx is enqueue inside the caller's transaction: the job exists exactly when the
+// caller's own writes commit.
+func enqueueTx(ctx context.Context, tx pgx.Tx, j newJob) (id int64, created bool, err error) {
+	err = tx.QueryRow(ctx, `
+		INSERT INTO jobs (queue, kind, payload, priority, run_at, max_attempts, idempotency_key)
+		VALUES ($1, $2, $3, $4, coalesce($5, now()), $6, $7)
+		ON CONFLICT (queue, idempotency_key) DO NOTHING
+		RETURNING id`,
+		j.Queue, j.Kind, j.Payload, j.Priority, j.RunAt, j.MaxAttempts, j.IdempotencyKey).Scan(&id)
+	if errors.Is(err, pgx.ErrNoRows) { // conflict: hand back the job that already has this key
+		return id, false, tx.QueryRow(ctx, `SELECT id FROM jobs WHERE queue = $1 AND idempotency_key = $2`,
+			j.Queue, j.IdempotencyKey).Scan(&id)
+	}
+	if err != nil {
+		return 0, false, err
+	}
+	_, err = tx.Exec(ctx, `SELECT pg_notify($1, '')`, "jobs_"+j.Queue)
+	return id, true, err
 }
 
 // dequeue claims up to limit due jobs in one statement. SKIP LOCKED lets concurrent
@@ -149,20 +158,36 @@ const fence = `id = $1 AND worker_id = $2 AND attempts = $3 AND status = 'runnin
 // complete records the outcome if this worker still holds the job. A failed job goes back
 // to queued with a backoff, or to dead once it has used max_attempts. It returns false
 // when the lease was lost, in which case the outcome is dropped: the job runs again.
-func complete(ctx context.Context, db *pgxpool.Pool, j job, workerID string, jobErr error) (bool, error) {
+// after, if set, runs in the same transaction with the job's new status, so a workflow
+// step's result and the steps it unblocks commit together with the job.
+func complete(ctx context.Context, db *pgxpool.Pool, j job, workerID string, jobErr error, after func(ctx context.Context, tx pgx.Tx, status string) error) (held bool, err error) {
 	var lastErr *string
 	if jobErr != nil {
 		msg := jobErr.Error()
 		lastErr = &msg
 	}
-	tag, err := db.Exec(ctx, `
-		UPDATE jobs SET
-		  status = CASE WHEN $4::text IS NULL THEN 'succeeded' WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
-		  run_at = CASE WHEN $4::text IS NOT NULL AND attempts < max_attempts THEN now() + $5 * interval '1 ms' ELSE run_at END,
-		  finished_at = CASE WHEN $4::text IS NULL OR attempts >= max_attempts THEN clock_timestamp() END,
-		  last_error = coalesce($4, last_error), lease_until = NULL
-		WHERE `+fence, j.ID, workerID, j.Attempts, lastErr, backoff(j.Attempts).Milliseconds())
-	return tag.RowsAffected() == 1, err
+	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		var status string
+		err := tx.QueryRow(ctx, `
+			UPDATE jobs SET
+			  status = CASE WHEN $4::text IS NULL THEN 'succeeded' WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+			  run_at = CASE WHEN $4::text IS NOT NULL AND attempts < max_attempts THEN now() + $5 * interval '1 ms' ELSE run_at END,
+			  finished_at = CASE WHEN $4::text IS NULL OR attempts >= max_attempts THEN clock_timestamp() END,
+			  last_error = coalesce($4, last_error), lease_until = NULL
+			WHERE `+fence+` RETURNING status`, j.ID, workerID, j.Attempts, lastErr, backoff(j.Attempts).Milliseconds()).Scan(&status)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil
+		}
+		if err != nil {
+			return err
+		}
+		held = true
+		if after != nil {
+			return after(ctx, tx, status)
+		}
+		return nil
+	})
+	return held, err
 }
 
 // heartbeat extends the lease. false means the job was taken away: abandon it.
@@ -183,33 +208,62 @@ func release(ctx context.Context, db *pgxpool.Pool, j job, workerID string) erro
 
 // reap requeues running jobs whose lease expired, or marks them dead once they have used
 // max_attempts, so a job that keeps crashing its worker can't loop forever. Safe to run from
-// several replicas at once: SKIP LOCKED gives each expired job to one of them.
+// several replicas at once: SKIP LOCKED gives each expired job to one of them. A workflow
+// step that dies here fails its run in the same transaction.
 // ponytail: requeued jobs aren't NOTIFYed; workers find them on their next 1 s poll.
 func reap(ctx context.Context, db *pgxpool.Pool) (requeued, dead int, err error) {
-	err = db.QueryRow(ctx, `
-		WITH r AS (
-		  UPDATE jobs SET
-		    status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
-		    finished_at = CASE WHEN attempts >= max_attempts THEN clock_timestamp() END,
-		    last_error = 'lease expired: worker died or lost its connection',
-		    run_at = now(), lease_until = NULL
-		  WHERE id = ANY(ARRAY(
-		    SELECT id FROM jobs WHERE status = 'running' AND lease_until < now()
-		    FOR UPDATE SKIP LOCKED LIMIT 1000))
-		  RETURNING status)
-		SELECT count(*) FILTER (WHERE status = 'queued'), count(*) FILTER (WHERE status = 'dead') FROM r`).
-		Scan(&requeued, &dead)
+	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		rows, err := tx.Query(ctx, `
+			UPDATE jobs SET
+			  status = CASE WHEN attempts >= max_attempts THEN 'dead' ELSE 'queued' END,
+			  finished_at = CASE WHEN attempts >= max_attempts THEN clock_timestamp() END,
+			  last_error = 'lease expired: worker died or lost its connection',
+			  run_at = now(), lease_until = NULL
+			WHERE id = ANY(ARRAY(
+			  SELECT id FROM jobs WHERE status = 'running' AND lease_until < now()
+			  FOR UPDATE SKIP LOCKED LIMIT 1000))
+			RETURNING kind, payload, status`)
+		if err != nil {
+			return err
+		}
+		type reaped struct {
+			kind, status string
+			payload      []byte
+		}
+		rs, err := pgx.CollectRows(rows, func(r pgx.CollectableRow) (x reaped, err error) {
+			err = r.Scan(&x.kind, &x.payload, &x.status)
+			return x, err
+		})
+		if err != nil {
+			return err
+		}
+		requeued, dead = 0, 0
+		for _, r := range rs {
+			if r.status == "queued" {
+				requeued++
+				continue
+			}
+			dead++
+			if isStep(r.kind) {
+				if err := stepDied(ctx, tx, r.payload, "lease expired: worker died or lost its connection"); err != nil {
+					return err
+				}
+			}
+		}
+		return nil
+	})
 	return requeued, dead, err
 }
 
-// retryDead puts a dead job back in its queue with a fresh set of attempts.
+// retryDead puts a dead job back in its queue with a fresh set of attempts. Not a workflow
+// step: its run already failed and ran its compensation.
 func retryDead(ctx context.Context, db *pgxpool.Pool, id int64) (bool, error) {
 	var ok bool
 	err := pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
 		var queue string
 		err := tx.QueryRow(ctx, `
 			UPDATE jobs SET status = 'queued', attempts = 0, run_at = now(), finished_at = NULL
-			WHERE id = $1 AND status = 'dead' RETURNING queue`, id).Scan(&queue)
+			WHERE id = $1 AND status = 'dead' AND kind NOT LIKE 'wf:%' RETURNING queue`, id).Scan(&queue)
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil
 		}

@@ -218,6 +218,40 @@ func run(role string) error {
 			}
 			return 200, map[string]bool{"ok": true}
 		})
+		route("POST /api/workflows/{name}/runs", func(r *http.Request) (int, any) {
+			var body struct {
+				Input json.RawMessage `json:"input"`
+			}
+			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&body); err != nil {
+				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
+			}
+			if _, ok := workflows[r.PathValue("name")]; !ok {
+				return 404, map[string]string{"error": "no such workflow"}
+			}
+			id, err := startRun(r.Context(), pool, r.PathValue("name"), body.Input)
+			if err != nil {
+				slog.Error("start run failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 201, map[string]any{"id": id}
+		})
+		route("GET /api/workflows/runs/{id}", func(r *http.Request) (int, any) {
+			id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+			if err != nil {
+				return 400, map[string]string{"error": "id must be a number"}
+			}
+			run, err := getRun(r.Context(), pool, id)
+			if errors.Is(err, errNoRun) {
+				return 404, map[string]string{"error": "not found"}
+			}
+			if err != nil {
+				slog.Error("get run failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 200, run
+		})
 		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
 			var out struct {
 				ID         int64      `json:"id"`

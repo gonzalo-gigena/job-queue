@@ -126,7 +126,7 @@ func TestNoJobGoesToTwoWorkers(t *testing.T) {
 				}
 				mu.Unlock()
 				for _, j := range jobs {
-					if held, err := complete(ctx, db, j, id, nil); err != nil || !held {
+					if held, err := complete(ctx, db, j, id, nil, nil); err != nil || !held {
 						t.Error("complete:", held, err)
 					}
 				}
@@ -382,7 +382,7 @@ func TestRetriesThenDeadLetter(t *testing.T) {
 	fail := errors.New("boom")
 
 	j := claimOne(t, db, "w", q)
-	if held, err := complete(ctx, db, j, "w", fail); err != nil || !held {
+	if held, err := complete(ctx, db, j, "w", fail, nil); err != nil || !held {
 		t.Fatal(held, err)
 	}
 	status, attempts, runIn := jobState(t, db, id)
@@ -392,7 +392,7 @@ func TestRetriesThenDeadLetter(t *testing.T) {
 
 	db.Exec(ctx, `UPDATE jobs SET run_at = now() WHERE id = $1`, id) // skip the wait
 	j = claimOne(t, db, "w", q)
-	if held, err := complete(ctx, db, j, "w", fail); err != nil || !held {
+	if held, err := complete(ctx, db, j, "w", fail, nil); err != nil || !held {
 		t.Fatal(held, err)
 	}
 	if status, _, _ := jobState(t, db, id); status != "dead" {
@@ -409,7 +409,7 @@ func TestRetriesThenDeadLetter(t *testing.T) {
 		t.Fatalf("after retry: %s with %d attempts, want queued with 0", status, attempts)
 	}
 	j = claimOne(t, db, "w", q)
-	if held, err := complete(ctx, db, j, "w", nil); err != nil || !held {
+	if held, err := complete(ctx, db, j, "w", nil, nil); err != nil || !held {
 		t.Fatal(held, err)
 	}
 	if status, _, _ := jobState(t, db, id); status != "succeeded" {
@@ -443,7 +443,7 @@ func TestReaperAndFencing(t *testing.T) {
 	if held, _ := heartbeat(ctx, db, zombie, "w1"); held {
 		t.Fatal("the zombie's heartbeat extended a lease it lost")
 	}
-	if held, _ := complete(ctx, db, zombie, "w1", nil); held {
+	if held, _ := complete(ctx, db, zombie, "w1", nil, nil); held {
 		t.Fatal("the zombie completed a job it lost")
 	}
 	if status, _, _ := jobState(t, db, id); status != "running" {
@@ -458,7 +458,7 @@ func TestReaperAndFencing(t *testing.T) {
 	if status, _, _ := jobState(t, db, id); status != "dead" {
 		t.Fatalf("expired on its last attempt: %s, want dead", status)
 	}
-	if held, _ := complete(ctx, db, fresh, "w1", nil); held {
+	if held, _ := complete(ctx, db, fresh, "w1", nil, nil); held {
 		t.Fatal("completed a job the reaper marked dead")
 	}
 }
