@@ -29,6 +29,8 @@ jobs:
         run: sh infra/scheduler-failover.sh
       - name: "Workflow chaos: 300 runs of a 5-step fan-out/fan-in DAG while workers are SIGKILLed"
         run: sh infra/workflow-chaos.sh 4
+      - name: "Limits: concurrency and rate limits hold across 5 worker replicas"
+        run: sh infra/limits-test.sh 5
       - name: "Chaos test: 10,000 jobs while every worker is SIGKILLed at random"
         run: sh infra/chaos-test.sh 4
       - name: Logs

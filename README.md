@@ -4,9 +4,9 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 4 of 8, workflows. Jobs run with leases, retries with backoff, a dead-letter state and
-> graceful shutdown; cron schedules run on a leader-elected scheduler; multi-step workflows run as DAGs with
-> compensation. Rate limits and the dashboard aren't built yet.
+> **Status:** phase 5 of 8, concurrency and rate limits. Jobs run with leases, retries with backoff, a
+> dead-letter state and graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as
+> DAGs with compensation; queues can have concurrency and rate limits. The dashboard isn't built yet.
 > The API, including the dead-letter actions, has no authentication yet: don't expose it publicly.
 
 ## Run it
@@ -63,6 +63,18 @@ checks schedules every second. If it dies, Postgres closes its session, the lock
 over within about a second. Each run is enqueued with the idempotency key `schedule_id:time`, and runs missed
 while no leader was up are enqueued on takeover (up to 100 per schedule per tick), so a failover neither skips
 nor duplicates a run.
+
+### Queue limits
+
+```bash
+curl -X PUT localhost:8080/api/queues/emails/limits -d '{"max_running":5,"rate_per_sec":10,"burst":20}'
+curl -X DELETE localhost:8080/api/queues/emails/limits   # unlimited again
+```
+
+`max_running` caps how many of the queue's jobs run at once across every worker; `rate_per_sec` caps how many
+start per second, with a token bucket of `burst` (default `max(1, rate_per_sec)`). Either can be `null`. A worker
+that finds the bucket empty sleeps until the next token is due rather than the 1 s poll. Workers with several
+queues in `WORKER_QUEUES` try them in the order listed.
 
 ### Workflows
 
@@ -135,6 +147,7 @@ id as the provider's idempotency key instead.
 | Scale the workers | `docker compose up -d --scale worker=3`, check with `sh infra/worker-smoke.sh 3` |
 | Scheduler failover drill | `sh infra/scheduler-failover.sh` (SIGKILLs the leader) |
 | Workflow chaos: kill workers mid-DAG | `sh infra/workflow-chaos.sh 4` (300 runs of `demo`) |
+| Limits across 5 workers | `sh infra/limits-test.sh 5` |
 | Chaos test: kill workers mid-run | `sh infra/chaos-test.sh 4` (10,000 jobs, about 1–4 minutes) |
 | Lint migrations | `sh common/scripts/check-migrations.sh` |
 | Measure enqueue → handled | `docker compose --profile loadtest run --rm k6 run /scripts/latency.js` |
@@ -203,7 +216,9 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 |---|---|---|---|
 | Broker | Postgres only | Redis (Sidekiq-style), RabbitMQ, Kafka | A job can be enqueued in the same transaction as the app's own write, so it exists exactly when the data does. One stateful service to run and back up. Cost: one Postgres node caps throughput, roughly thousands of jobs/s depending on job size. |
 | Claiming jobs | One `UPDATE … WHERE id = ANY(ARRAY(SELECT … FOR UPDATE SKIP LOCKED LIMIT n))` | `SELECT` then `UPDATE`, an advisory lock per job, or the common `id IN (SELECT …)` | One round trip, and concurrent workers skip rows another worker holds instead of queueing behind them. `IN` looks the same, but Postgres may re-scan it and lock more rows each time: on 18 it claimed 5 jobs with `LIMIT 1`. `ARRAY(…)` is evaluated once. |
-| Dequeue index | `queue = $1` when a worker serves one queue | Always `queue = ANY($1)` | With `ANY`, Postgres sorts every queued row on each claim (about 12 ms at 50,000 queued) instead of reading the partial index in order (under 1 ms). Cost: a worker with several queues still pays for the sort. |
+| Dequeue index | One claim statement per queue (`queue = $1`), queues tried in the order listed | `queue = ANY($1)` | With `ANY`, Postgres sorts every queued row on each claim (about 12 ms at 50,000 queued) instead of reading the partial index in order (under 1 ms). Cost: `priority` orders jobs within a queue, not across a worker's queues. |
+| Concurrency limit | Lock the queue's `queue_limits` row (`FOR UPDATE`), then count running jobs in the next statement, in one transaction | Counting inside the claim query | Concurrent workers all see the same count. The count also can't be in the locking statement: under READ COMMITTED its snapshot predates the lock wait. Without the lock, `TestConcurrencyLimitHoldsAcrossWorkers` saw 16 running against a limit of 3. Cost: claims on a limited queue are serialized, and every claim is now a 3–4 round-trip transaction. |
+| Rate limit | Token bucket in the same `queue_limits` row, refilled lazily at claim time; an empty bucket tells the worker when to retry | A counter per second, or a Redis bucket | No refill process, and it rides the lock the concurrency limit already takes. Sleeping until the next token (not the 1 s poll) took 5 workers from 4/s to 18.9/s against a 20/s limit, never over 20 in any 1 s window. |
 | Waking workers | `LISTEN/NOTIFY` in the enqueue transaction, plus a 1 s poll | Polling only | Jobs start within milliseconds, and polling catches a missed notification. Cost: `LISTEN` needs a direct connection per worker, not PgBouncer. |
 | Delivery guarantee | At-least-once, with leases and a heartbeat | Claiming exactly-once | Exactly-once isn't possible once a worker can die mid-job. Leases fence out zombie workers, and handlers must be idempotent: write a `processed(job_id)` row in the same transaction as the side effect. The chaos test kills every worker 8 times during 10,000 jobs and still gets exactly 10,000 effects. |
 | Fencing token | `attempts`, checked with `worker_id` on every heartbeat and completion | `worker_id` alone | A worker's id is its hostname, and a restarted container keeps it. With `worker_id` alone, a zombie could complete the job its own restarted replica had just reclaimed. `attempts` goes up on every claim, so it is never reused. |
@@ -286,7 +301,7 @@ run twice. CI runs it on every PR and fails on any duplicate or lost job.
 | Part | Scales by | Limit |
 |---|---|---|
 | `api` | `--scale api=N` (stateless) | Postgres connections |
-| `worker` | `--scale worker=N`, one job at a time each | Throughput grows until Postgres saturates. Phase 5 adds per-queue concurrency and rate limits that hold across replicas. |
+| `worker` | `--scale worker=N`, one job at a time each | Throughput grows until Postgres saturates. Per-queue concurrency and rate limits hold across replicas. |
 | `scheduler` | 2 replicas, one leader | The reaper runs on every replica. For cron, only the leader works and the standby takes over in about 1 s. |
 | Postgres | One primary | The ceiling for the whole system |
 

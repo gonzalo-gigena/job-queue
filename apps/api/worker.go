@@ -126,7 +126,7 @@ func work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, que
 		// Not cancelled by shutdown: a claim cancelled after Postgres committed it would
 		// leave the job running with nobody working on it.
 		claimCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), claimTimeout)
-		jobs, err := dequeue(claimCtx, db, workerID, queues, 1)
+		jobs, retryIn, err := dequeue(claimCtx, db, workerID, queues, 1)
 		cancel()
 		if err != nil {
 			slog.Error("dequeue failed", "err", err)
@@ -134,10 +134,14 @@ func work(ctx context.Context, db *pgxpool.Pool, listenURL, workerID string, que
 			continue
 		}
 		if len(jobs) == 0 {
+			idle := pollInterval
+			if retryIn > 0 && retryIn < idle {
+				idle = retryIn // a rate-limited queue gets its next token then
+			}
 			select {
 			case <-ctx.Done():
 			case <-wake:
-			case <-time.After(pollInterval):
+			case <-time.After(idle):
 			case <-listening:
 				if ctx.Err() == nil {
 					return fmt.Errorf("listen connection: %w", listenErr) // exit; compose restarts us
