@@ -1,4 +1,4 @@
-package main
+package qq
 
 import (
 	"context"
@@ -14,9 +14,9 @@ import (
 
 // testWorkflow is a → b, c, d → e on its own queue, plus an "undo" compensation step.
 // Every step returns its parents' n values summed, plus one; the step named in fail errors.
-func testWorkflow(q, fail string) *workflow {
-	f := func(name string) stepFunc {
-		return func(_ context.Context, _ *pgxpool.Pool, in stepInput) (any, error) {
+func testWorkflow(q, fail string) *Workflow {
+	f := func(name string) StepFunc {
+		return func(_ context.Context, _ *pgxpool.Pool, in StepInput) (any, error) {
 			if name == fail {
 				return nil, errors.New("asked to fail")
 			}
@@ -29,11 +29,11 @@ func testWorkflow(q, fail string) *workflow {
 			return map[string]int{"n": sum}, nil
 		}
 	}
-	w := newWorkflow(q).
-		step("a", f("a")).
-		step("b", f("b"), "a").step("c", f("c"), "a").step("d", f("d"), "a").
-		step("e", f("e"), "b", "c", "d").
-		onFailure("undo", f("undo"))
+	w := NewWorkflow(q).
+		Step("a", f("a")).
+		Step("b", f("b"), "a").Step("c", f("c"), "a").Step("d", f("d"), "a").
+		Step("e", f("e"), "b", "c", "d").
+		OnFailure("undo", f("undo"))
 	w.queue, w.maxAttempts = q, 1
 	return w
 }
@@ -42,7 +42,7 @@ func runWorkers(t *testing.T, db *pgxpool.Pool, q string, n int) {
 	ctx, cancel := context.WithCancel(context.Background())
 	var wg sync.WaitGroup
 	for i := range n {
-		wg.Go(func() { work(ctx, db, os.Getenv("DATABASE_URL"), "w"+string(rune('0'+i)), []string{q}) })
+		wg.Go(func() { Work(ctx, db, os.Getenv("DATABASE_URL"), "w"+string(rune('0'+i)), []string{q}) })
 	}
 	t.Cleanup(func() { cancel(); wg.Wait() })
 }
@@ -75,7 +75,7 @@ func TestWorkflowFanOutFanIn(t *testing.T) {
 	runWorkers(t, db, q, 4) // b, c and d finish at the same moment: the fan-in race the run lock closes
 	var ids []int64
 	for range 20 {
-		id, err := startRun(context.Background(), db, q, nil)
+		id, err := StartRun(context.Background(), db, q, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -107,7 +107,7 @@ func TestWorkflowFailureRunsCompensation(t *testing.T) {
 	db, q := testDB(t)
 	testWorkflow(q, "c")
 	runWorkers(t, db, q, 2)
-	id, err := startRun(context.Background(), db, q, nil)
+	id, err := StartRun(context.Background(), db, q, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -133,7 +133,7 @@ func TestReaperFailsCrashingStep(t *testing.T) {
 	db, q := testDB(t)
 	ctx := context.Background()
 	testWorkflow(q, "")
-	id, err := startRun(ctx, db, q, nil)
+	id, err := StartRun(ctx, db, q, nil)
 	if err != nil {
 		t.Fatal(err)
 	}
