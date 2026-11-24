@@ -5,6 +5,7 @@ go 1.27
 require (
 	github.com/jackc/pgx/v5 v5.13.0
 	github.com/prometheus/client_golang v1.25.0
+	github.com/robfig/cron/v3 v3.0.1
 )
 
 require (

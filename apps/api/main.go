@@ -2,7 +2,7 @@
 //
 //	api              stateless HTTP service: enqueue and query jobs
 //	api worker       claims and runs jobs (WORKER_QUEUES, default "default")
-//	api scheduler    requeues jobs whose lease expired (cron comes in phase 3)
+//	api scheduler    requeues jobs whose lease expired; the leader replica runs cron
 //	api healthcheck  lets the distroless image check itself
 package main
 
@@ -112,7 +112,13 @@ func run(role string) error {
 	})
 	switch role {
 	case "scheduler":
-		go func() { defer close(workDone); reapLoop(ctx, pool) }()
+		// The advisory lock is session state: like LISTEN, it needs a direct connection.
+		directURL := envOr("DIRECT_DATABASE_URL", dbURL)
+		go func() {
+			defer close(workDone)
+			go reapLoop(ctx, pool)
+			leadLoop(ctx, pool, directURL)
+		}()
 	case "worker":
 		queues := splitQueues(envOr("WORKER_QUEUES", "default"))
 		if len(queues) == 0 {
@@ -176,6 +182,42 @@ func run(role string) error {
 				return 200, map[string]any{"id": id}
 			})
 		}
+		route("PUT /api/schedules/{id}", func(r *http.Request) (int, any) {
+			var s schedule
+			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&s); err != nil {
+				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
+			}
+			s.ID = r.PathValue("id")
+			if err := s.validate(); err != nil {
+				return 400, map[string]string{"error": err.Error()}
+			}
+			if err := putSchedule(r.Context(), pool, s); err != nil {
+				slog.Error("put schedule failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 200, s
+		})
+		route("GET /api/schedules", func(r *http.Request) (int, any) {
+			s, err := listSchedules(r.Context(), pool)
+			if err != nil {
+				slog.Error("list schedules failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 200, s
+		})
+		route("DELETE /api/schedules/{id}", func(r *http.Request) (int, any) {
+			tag, err := pool.Exec(r.Context(), `DELETE FROM schedules WHERE id = $1`, r.PathValue("id"))
+			if err != nil {
+				slog.Error("delete schedule failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			if tag.RowsAffected() == 0 {
+				return 404, map[string]string{"error": "not found"}
+			}
+			return 200, map[string]bool{"ok": true}
+		})
 		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
 			var out struct {
 				ID         int64      `json:"id"`
