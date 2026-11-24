@@ -21,12 +21,12 @@ jobs:
         run: docker compose -f compose.yaml run --rm test
       - name: Stack with 3 api replicas + smoke test
         run: sh common/scripts/ci-stack.sh 3
-      - name: "Example app: enqueues through the TypeScript client only, and its jobs run"
-        run: sh infra/example-smoke.sh
       - name: Stack with 3 workers, each takes jobs
         run: |
           docker compose -f compose.yaml up -d --wait --build --scale worker=3
           sh infra/worker-smoke.sh 3
+      - name: "Example app: enqueues through the TypeScript client only, and its jobs run"
+        run: sh infra/example-smoke.sh
       - name: Enqueue to handled under 50 ms (p95, idle queue)
         run: docker compose -f compose.yaml --profile loadtest run --rm k6 run --quiet /scripts/latency.js
       - name: "Scheduler failover: SIGKILL the leader, standby takes over within 5 s, no run skipped or duplicated"
