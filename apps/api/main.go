@@ -252,6 +252,33 @@ func run(role string) error {
 			}
 			return 200, run
 		})
+		route("PUT /api/queues/{queue}/limits", func(r *http.Request) (int, any) {
+			var l queueLimits
+			dec := json.NewDecoder(http.MaxBytesReader(nil, r.Body, 1<<20))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&l); err != nil {
+				return 400, map[string]string{"error": "invalid JSON: " + err.Error()}
+			}
+			q := r.PathValue("queue")
+			if !queueName.MatchString(q) {
+				return 400, map[string]string{"error": "queue must match " + queueName.String()}
+			}
+			if err := l.validate(); err != nil {
+				return 400, map[string]string{"error": err.Error()}
+			}
+			if err := setLimits(r.Context(), pool, q, l); err != nil {
+				slog.Error("set limits failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 200, l
+		})
+		route("DELETE /api/queues/{queue}/limits", func(r *http.Request) (int, any) {
+			if _, err := pool.Exec(r.Context(), `DELETE FROM queue_limits WHERE queue = $1`, r.PathValue("queue")); err != nil {
+				slog.Error("delete limits failed", "err", err)
+				return 500, map[string]string{"error": "internal error"}
+			}
+			return 200, map[string]bool{"ok": true}
+		})
 		route("GET /api/jobs/{id}", func(r *http.Request) (int, any) {
 			var out struct {
 				ID         int64      `json:"id"`

@@ -138,7 +138,7 @@ func TestReaperFailsCrashingStep(t *testing.T) {
 		t.Fatal(err)
 	}
 	// Step a's worker claims it and dies: with max_attempts 1 the reaper marks it dead.
-	if _, err := dequeue(ctx, db, "w", []string{q}, 1); err != nil {
+	if _, _, err := dequeue(ctx, db, "w", []string{q}, 1); err != nil {
 		t.Fatal(err)
 	}
 	db.Exec(ctx, `UPDATE jobs SET lease_until = now() - interval '1 s' WHERE queue = $1`, q)

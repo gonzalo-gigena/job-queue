@@ -93,40 +93,128 @@ func enqueueTx(ctx context.Context, tx pgx.Tx, j newJob) (id int64, created bool
 	return id, true, err
 }
 
-// dequeue claims up to limit due jobs in one statement. SKIP LOCKED lets concurrent
-// workers pass over rows another worker is claiming instead of waiting on them.
+// dequeue claims up to limit due jobs, trying queues in the order given. When a rate limit
+// held jobs back, retryIn says when the next token is due (0 otherwise).
+func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []string, limit int) (out []job, retryIn time.Duration, err error) {
+	for _, q := range queues {
+		if len(out) >= limit {
+			break
+		}
+		js, wait, err := claim(ctx, db, workerID, q, limit-len(out))
+		if err != nil {
+			return out, 0, err
+		}
+		if wait > 0 && (retryIn == 0 || wait < retryIn) {
+			retryIn = wait
+		}
+		out = append(out, js...)
+	}
+	return out, retryIn, nil
+}
+
+// claim takes up to limit due jobs from one queue, within its queue_limits row if it has one.
 //
-// Two changes from the textbook statement, each with a regression test:
+// The claim itself is one statement. SKIP LOCKED lets concurrent workers pass over rows
+// another worker is claiming instead of waiting on them. Two changes from the textbook
+// statement, each with a regression test:
 //   - id = ANY(ARRAY(...)), not id IN (...): the planner may re-scan an IN subquery,
 //     and each re-scan locks more rows, so LIMIT 1 can claim the whole queue.
 //     ARRAY(...) is an InitPlan, evaluated exactly once.
-//   - queue = $2 for a single queue: with queue = ANY($2) Postgres can't read the partial
-//     index in priority order and sorts every queued row on each claim.
+//   - one queue per statement (queue = $2): with queue = ANY($2) Postgres can't read the
+//     partial index in priority order and sorts every queued row on each claim.
 //
-// ponytail: several queues in one worker still sort their backlog on every claim.
-// Run a worker per queue, or claim per queue with LATERAL, if those backlogs get large.
-func dequeue(ctx context.Context, db *pgxpool.Pool, workerID string, queues []string, limit int) ([]job, error) {
-	match, arg := "queue = ANY($2)", any(queues)
-	if len(queues) == 1 {
-		match, arg = "queue = $2", queues[0]
-	}
-	rows, err := db.Query(ctx, `
-		UPDATE jobs SET status = 'running', attempts = attempts + 1,
-		       lease_until = now() + interval '1 ms' * $4, worker_id = $1
-		WHERE id = ANY(ARRAY(
-		  SELECT id FROM jobs
-		  WHERE `+match+` AND status = 'queued' AND run_at <= now()
-		  ORDER BY priority DESC, run_at
-		  FOR UPDATE SKIP LOCKED LIMIT $3))
-		RETURNING id, kind, payload, attempts`, workerID, arg, limit, leaseDuration.Milliseconds())
-	if err != nil {
-		return nil, err
-	}
-	return pgx.CollectRows(rows, func(r pgx.CollectableRow) (job, error) {
-		var j job
-		err := r.Scan(&j.ID, &j.Kind, &j.Payload, &j.Attempts)
-		return j, err
+// Limits: lock the queue's limits row first, then count running jobs in a later statement.
+// Counting in the claim statement alone isn't enough, because concurrent workers all see the
+// same count. Counting in the locking statement isn't either: under READ COMMITTED a
+// statement's snapshot is taken before it waits for the lock, so it would miss the claims
+// the previous lock holder just committed.
+func claim(ctx context.Context, db *pgxpool.Pool, workerID, queue string, limit int) (jobs []job, retryIn time.Duration, err error) {
+	err = pgx.BeginFunc(ctx, db, func(tx pgx.Tx) error {
+		var maxRunning *int32
+		var rate, tokens *float64
+		var paused bool
+		err := tx.QueryRow(ctx, `
+			SELECT max_running, rate_per_sec, paused,
+			       least(burst, tokens + rate_per_sec * extract(epoch FROM clock_timestamp() - refilled_at))
+			FROM queue_limits WHERE queue = $1 FOR UPDATE`, queue).Scan(&maxRunning, &rate, &paused, &tokens)
+		limited := err == nil
+		if err != nil && !errors.Is(err, pgx.ErrNoRows) {
+			return err
+		}
+		if paused {
+			return nil
+		}
+		if tokens != nil && int(*tokens) < limit {
+			limit = int(*tokens)
+			if limit == 0 {
+				retryIn = time.Duration((1 - *tokens) / *rate * float64(time.Second))
+			}
+		}
+		if limit <= 0 {
+			return nil
+		}
+		running, args := "$3", []any{workerID, queue, limit, leaseDuration.Milliseconds()}
+		if maxRunning != nil {
+			running, args = "least($3, $5 - (SELECT count(*) FROM jobs WHERE queue = $2 AND status = 'running'))", append(args, *maxRunning)
+		}
+		rows, err := tx.Query(ctx, `
+			UPDATE jobs SET status = 'running', attempts = attempts + 1, started_at = clock_timestamp(),
+			       lease_until = now() + interval '1 ms' * $4, worker_id = $1
+			WHERE id = ANY(ARRAY(
+			  SELECT id FROM jobs
+			  WHERE queue = $2 AND status = 'queued' AND run_at <= now()
+			  ORDER BY priority DESC, run_at
+			  FOR UPDATE SKIP LOCKED LIMIT greatest(0, `+running+`)))
+			RETURNING id, kind, payload, attempts`, args...)
+		if err != nil {
+			return err
+		}
+		if jobs, err = pgx.CollectRows(rows, func(r pgx.CollectableRow) (j job, err error) {
+			err = r.Scan(&j.ID, &j.Kind, &j.Payload, &j.Attempts)
+			return j, err
+		}); err != nil || !limited || rate == nil {
+			return err
+		}
+		_, err = tx.Exec(ctx, `UPDATE queue_limits SET tokens = $2, refilled_at = clock_timestamp() WHERE queue = $1`,
+			queue, *tokens-float64(len(jobs)))
+		return err
 	})
+	return jobs, retryIn, err
+}
+
+type queueLimits struct {
+	MaxRunning *int32   `json:"max_running"`  // at most this many running at once, across every worker
+	RatePerSec *float64 `json:"rate_per_sec"` // at most this many starts per second (token bucket)
+	Burst      *float64 `json:"burst"`        // bucket size, default max(1, rate_per_sec)
+}
+
+func (l *queueLimits) validate() error {
+	if l.MaxRunning != nil && *l.MaxRunning <= 0 {
+		return errors.New("max_running must be positive")
+	}
+	if l.RatePerSec != nil && !(*l.RatePerSec > 0 && *l.RatePerSec <= 1e6) {
+		return errors.New("rate_per_sec must be in (0, 1e6]")
+	}
+	if l.Burst == nil {
+		b := 1.0
+		if l.RatePerSec != nil && *l.RatePerSec > b {
+			b = *l.RatePerSec
+		}
+		l.Burst = &b
+	}
+	if !(*l.Burst >= 1 && *l.Burst <= 1e6) {
+		return errors.New("burst must be in [1, 1e6]")
+	}
+	return nil
+}
+
+// setLimits replaces a queue's limits; null fields mean unlimited. The bucket starts full.
+func setLimits(ctx context.Context, db *pgxpool.Pool, queue string, l queueLimits) error {
+	_, err := db.Exec(ctx, `
+		INSERT INTO queue_limits (queue, max_running, rate_per_sec, burst, tokens) VALUES ($1, $2, $3, $4, $4)
+		ON CONFLICT (queue) DO UPDATE SET max_running = $2, rate_per_sec = $3, burst = $4, tokens = $4, refilled_at = clock_timestamp()`,
+		queue, l.MaxRunning, l.RatePerSec, l.Burst)
+	return err
 }
 
 // A job's lease. The worker extends it every heartbeatInterval; the reaper requeues jobs
