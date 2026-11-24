@@ -109,7 +109,7 @@ func TestNoJobGoesToTwoWorkers(t *testing.T) {
 		wg.Go(func() {
 			id := fmt.Sprint("w", w)
 			for {
-				jobs, err := dequeue(ctx, db, id, []string{q}, 3)
+				jobs, _, err := dequeue(ctx, db, id, []string{q}, 3)
 				if err != nil {
 					t.Error(err)
 					return
@@ -169,7 +169,7 @@ func TestDequeueOrderAndRunAt(t *testing.T) {
 	// One at a time: RETURNING doesn't promise an order within a batch.
 	var got []string
 	for {
-		jobs, err := dequeue(ctx, db, "w", []string{q}, 1)
+		jobs, _, err := dequeue(ctx, db, "w", []string{q}, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -204,7 +204,7 @@ func TestDequeueNeverExceedsLimit(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, queues := range [][]string{{q}, {q, "other"}} {
-		jobs, err := dequeue(ctx, db, "w", queues, 1)
+		jobs, _, err := dequeue(ctx, db, "w", queues, 1)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -248,7 +248,7 @@ func TestDequeueReadsIndexInOrder(t *testing.T) {
 
 	before := rowsRead()
 	for range claims {
-		if _, err := dequeue(ctx, db, "w", []string{q}, 1); err != nil {
+		if _, _, err := dequeue(ctx, db, "w", []string{q}, 1); err != nil {
 			t.Fatal(err)
 		}
 	}
@@ -355,7 +355,7 @@ func TestBackoff(t *testing.T) {
 // claimOne claims the queue's next job, failing the test if there is none.
 func claimOne(t *testing.T, db *pgxpool.Pool, worker, q string) job {
 	t.Helper()
-	jobs, err := dequeue(context.Background(), db, worker, []string{q}, 1)
+	jobs, _, err := dequeue(context.Background(), db, worker, []string{q}, 1)
 	if err != nil || len(jobs) != 1 {
 		t.Fatalf("claim: %d jobs, %v", len(jobs), err)
 	}
