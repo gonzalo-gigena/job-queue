@@ -4,7 +4,7 @@ A Postgres-backed job queue with retries, cron schedules, multi-step workflows a
 
 The step-by-step build plan is in [PLAN.md](PLAN.md).
 
-> **Status:** phase 6 of 8, dashboard. Jobs run with leases, retries with backoff, a dead-letter state and
+> **Status:** phase 7 of 8, scale and retention. Jobs run with leases, retries with backoff, a dead-letter state and
 > graceful shutdown; cron schedules run on a leader-elected scheduler; workflows run as DAGs with compensation;
 > queues have concurrency and rate limits; a live dashboard shows and controls it all.
 > The dashboard and `/api/admin/*` need `ADMIN_TOKEN`. The app-facing endpoints (enqueue, job status, start a
@@ -167,6 +167,7 @@ id as the provider's idempotency key instead.
 | Limits across 5 workers | `sh infra/limits-test.sh 5` |
 | Chaos test: kill workers mid-run | `sh infra/chaos-test.sh 4` (10,000 jobs, about 1–4 minutes) |
 | Lint migrations | `sh common/scripts/check-migrations.sh` |
+| Throughput at 1, 2, 4, 8 workers | `sh infra/throughput.sh` |
 | Measure enqueue → handled | `docker compose --profile loadtest run --rm k6 run /scripts/latency.js` |
 | Prove scaling works | `sh common/scripts/smoke.sh 3` |
 | The api replica check from CI | `sh common/scripts/ci-stack.sh 3` (ends with `down -v`) |
@@ -207,14 +208,26 @@ Postgres is the only stateful service. Workers claim jobs with `FOR UPDATE SKIP 
 ## Stack
 
 - **api:** Go 1.27 (`net/http` + `pgx` + Prometheus client), distroless runtime image. Stateless, so it scales with `--scale api=N`.
-- **worker:** the same binary run as `api worker`. It has one direct connection for `LISTEN` (`DIRECT_DATABASE_URL`,
-  which defaults to `DATABASE_URL`) and a pool for everything else.
+- **worker:** the same binary run as `api worker`. Its pool goes through PgBouncer (`DATABASE_URL`); `LISTEN` uses
+  one direct connection (`DIRECT_DATABASE_URL`). After a NOTIFY wake-up it waits 0–20 ms at random, so idle
+  workers don't all hit the dequeue query in the same instant.
+- **PgBouncer 1.24:** transaction pooling for every pool (api, worker, scheduler), 20 server connections.
+  1.21+ tracks protocol-level prepared statements (`max_prepared_statements`), so pgx's statement cache works
+  through it. Session state can't go through it: `LISTEN` and the scheduler's advisory lock use direct connections.
 - **scheduler:** the same binary run as `api scheduler`, two replicas. Both run the lease reaper (safe
   concurrently); the advisory-lock leader also runs cron. Timezones are embedded (`time/tzdata`), since the
   distroless image has no zoneinfo.
 - **Caddy:** the only service with a host port. It load-balances `/api/*` across every
   replica (`import lb api 8080`, from common) and serves `apps/web`.
 - **Postgres 18:** migrations run once before the api starts (`golang-migrate`).
+- **Retention:** the scheduler leader moves `succeeded` and `cancelled` jobs older than 1 hour to `jobs_archive`
+  (5,000 per statement, `DELETE … RETURNING` into `INSERT`), once a minute. `jobs_archive` is partitioned by day
+  on `finished_at`; the leader creates partitions two days ahead and drops those older than 7 days, and prunes
+  `processed` markers of the same age. `dead` jobs stay until retried or discarded. An archived job's
+  idempotency key is free again, so keys deduplicate for an hour, not forever.
+- **Autovacuum:** `jobs` vacuums at 1% dead rows (`autovacuum_vacuum_scale_factor = 0.01`, and the same for
+  inserts), not the default 20%: every row is updated several times and then deleted, and a bloated `jobs`
+  slows every claim.
 - **common/:** git submodule with the shared fakes, scripts, Caddy snippet and Prometheus.
   See [portfolio-common](common/README.md).
 
@@ -244,6 +257,9 @@ profile. Caddy gets TLS automatically. CI pushes multi-arch images to GHCR on ev
 | Shutdown | Stop claiming, 25 s to finish, then cancel and release the job, giving the attempt back | Waiting for the job, or dropping it | Inside compose's 35 s grace period, so the job is handed back rather than left for the reaper. A deploy doesn't push a job toward `dead`. |
 | Live dashboard | Server-Sent Events, each stream polling Postgres every 1 s | WebSockets, `LISTEN` per viewer | One-way updates are all it needs, `EventSource` reconnects by itself, and Caddy passes the stream through. Cost: one overview query per viewer per second. |
 | Admin auth | HTTP basic auth (password `ADMIN_TOKEN`) or a bearer token on `/api/admin/*`, constant-time compare | No auth, or a login page with sessions | An open admin panel can cancel and retry anyone's jobs. Basic auth is native in the browser, so no login page. Cost: one shared secret, no per-user audit. |
+| Retention | Archive finished jobs to a day-partitioned `jobs_archive`, drop partitions after 7 days | Partitioning `jobs` itself, or `DELETE` in place | A unique index on a partitioned table must include the partition key, which would break `UNIQUE (queue, idempotency_key)`. Dropping a partition is instant and leaves no dead rows. Cost: idempotency keys last 1 hour (the archive delay); a separate `idempotency_keys` table would keep them longer. |
+| Connection pooling | PgBouncer in transaction mode for pools, direct connections for `LISTEN` and the leader lock | Direct connections everywhere | 8 workers + api + 2 schedulers would hold ~100 server connections; through PgBouncer they share 20. Cost: one more hop per round trip, and PgBouncer is single-threaded (31% of a core at the no-op ceiling). |
+| NOTIFY jitter | 0–20 ms random delay after a wake-up | PLAN.md's 0–50 ms, or none | Spreads idle workers' claims. At 50 ms, p95 enqueue → handled went from 2 ms to 34 ms with 3 workers, and one worker would sit at the 50 ms target; at 20 ms it is 18 ms. |
 | Reaper | One `UPDATE … SKIP LOCKED` on a partial index of running jobs, on every scheduler replica | Only the leader reaps | Concurrent reapers each take different rows, so it needs no leader. The index only holds running jobs, so it stays tiny however large `jobs` grows. |
 | Scheduler leader | `pg_try_advisory_lock` on a direct connection, standbys retry every 1 s | etcd or Raft, or one scheduler | If the leader dies, its connection closes and the lock frees: the CI drill SIGKILLs the leader container and the standby leads 1 s later. Each run's idempotency key (`schedule_id:time`) and `FOR UPDATE SKIP LOCKED` on the schedule row make a brief two-leader overlap harmless. Cost: a leader cut off by a network partition (not killed) holds the lock until TCP notices. |
 | Missed cron runs | Enqueue every missed run on takeover, 100 per schedule per tick | Skip to the next future run | The failover test demands no skipped run. Cost: after a long outage a minutely schedule fires a burst of catch-up jobs; disable it first if that's wrong for the job. |
@@ -319,14 +335,44 @@ run twice. CI runs it on every PR and fails on any duplicate or lost job.
 
 | Part | Scales by | Limit |
 |---|---|---|
-| `api` | `--scale api=N` (stateless) | Postgres connections |
-| `worker` | `--scale worker=N`, one job at a time each | Throughput grows until Postgres saturates. Per-queue concurrency and rate limits hold across replicas. |
+| `api` | `--scale api=N` (stateless) | PgBouncer's 20 server connections |
+| `worker` | `--scale worker=N`, one job at a time each | Linear for jobs that do real work; no-op jobs top out at ~1,500/s (measured below). Per-queue limits hold across replicas. |
 | `scheduler` | 2 replicas, one leader | The reaper runs on every replica. For cron, only the leader works and the standby takes over in about 1 s. |
 | Postgres | One primary | The ceiling for the whole system |
 
+**Throughput.** `sh infra/throughput.sh` inserts jobs into a running stack and divides by the time from the
+first start to the last finish, on Postgres's clock: 5,000 no-op jobs, and 200 × workers jobs that sleep 50 ms.
+One run on the shared Apple M1 laptop (8 CPUs for Docker, other projects' stacks running, load average 3–8),
+through PgBouncer:
+
+| workers | no-op jobs/s | 50 ms jobs/s | 50 ms ideal (20/s per worker) |
+|---|---|---|---|
+| 1 | 847 | 18 | 20 |
+| 2 | 1,342 | 36 | 40 |
+| 4 | 1,496 | 72 | 80 |
+| 8 | 1,283 | 147 | 160 |
+
+```mermaid
+xychart-beta
+  title "Jobs/s by worker count"
+  x-axis "workers" [1, 2, 4, 8]
+  y-axis "jobs/s" 0 --> 1600
+  line "no-op" [847, 1342, 1496, 1283]
+  line "50 ms ×10" [180, 360, 720, 1470]
+```
+
+(The 50 ms line is ×10 so both fit one axis.)
+
+**50 ms jobs scale linearly** to 8 workers, at 90–92% of ideal: the queue's overhead per job is about 5 ms.
+**No-op jobs saturate at about 1,300–1,500 jobs/s, reached at 2–4 workers**, and 8 workers is slightly slower
+than 4 (more contention at the head of the queue). At that point Postgres used about 0.8 of a core and PgBouncer
+0.3, so it isn't CPU. Each job costs two commits (claim, complete) and about 7 round trips through PgBouncer.
+With `synchronous_commit = off` the 4-worker no-op rate went from 1,496 to 1,870 jobs/s, so commit flushes are
+about a fifth of the ceiling and round trips most of the rest.
+
 ### Where it breaks next
 
-- **The dequeue query on a busy Postgres.** First: PgBouncer for workers (transaction mode), a 0–50 ms random delay after each NOTIFY so idle workers don't all query at once, and archiving finished jobs to a day-partitioned table so the hot table stays small and vacuum keeps up.
+- **Past ~1,500 jobs/s on one node:** claim several jobs per round trip (`dequeue` already takes a limit) and run
+  them concurrently in one worker, which divides the claim cost; then `synchronous_commit = off` for queues that
+  can lose the last few hundred ms of completions on a crash (they'd just run again).
 - **Past one Postgres node.** Shard queues across databases, or move to Kafka or NATS. Portfolio-scale load never gets there.
-
-Phase 7 adds the real test: jobs/s at 1, 2, 4 and 8 workers with no-op jobs and with 50 ms jobs (`REPLICAS="1 2 4 8" SERVICE=worker`).
