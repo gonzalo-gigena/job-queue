@@ -39,7 +39,7 @@ type stepDef struct {
 
 type workflow struct {
 	name, queue string
-	maxAttempts int32 // per step job
+	maxAttempts int32    // per step job
 	order       []string // definition order, so runs list their steps predictably
 	steps       map[string]stepDef
 }
