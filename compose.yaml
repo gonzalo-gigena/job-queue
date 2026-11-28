@@ -164,7 +164,7 @@ services:
   # The demo producer: realistic traffic through the TypeScript client only.
   # docker compose --profile demo up -d example-app
   example-app:
-    image: node:24.22-alpine
+    image: node:26.13-alpine
     profiles: [demo]
     working_dir: /apps/example
     volumes:
